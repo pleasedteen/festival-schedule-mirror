@@ -1,0 +1,27 @@
+{
+  "name": "theatre-festival-desk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "戏剧节服务台：跨剧场公告采集、改场双端确认与排期查询",
+  "main": "dist/cli.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "mock": "npm run build && node dist/cli.js mock",
+    "collect": "npm run build && node dist/cli.js collect",
+    "query": "npm run build && node dist/cli.js query",
+    "repair": "npm run build && node dist/cli.js repair",
+    "test": "npm run build && node dist/test/e2e-run.js",
+    "test:unit": "npm run build && node dist/test/unit-run.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.4.4-r.4",
+    "cheerio": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.6.3"
+  }
+}
