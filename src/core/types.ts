@@ -31,6 +31,9 @@ export interface ParsedPage {
   announcements: AnnouncementInput[];
   nextUrl: string | null;
   pageLabel: string | null;
+  pageNo: number | null;
+  pageCount: number | null;
+  listToken: string | null;
 }
 
 export interface AnnouncementRow extends AnnouncementInput {

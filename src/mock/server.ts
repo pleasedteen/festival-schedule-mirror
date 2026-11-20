@@ -4,9 +4,13 @@ import { AddressInfo } from 'node:net';
 import { VENUES } from '../venues';
 import {
   PAGE_SIZE,
+  editVenueContent,
   itemsForPage,
+  listTokenOf,
+  longVenueContent,
   pageCount,
   venueContent,
+  type ListEdit,
   type MockItem,
   type VenueContent,
 } from './content';
@@ -111,6 +115,7 @@ function renderPage(
   const venue = escapeHtml(content.venueId);
   const label = `${page} / ${total}`;
   const heading = `${venueLabel(content.venueId)} · 公告`;
+  const meta = `data-page="${page}" data-page-count="${total}" data-list-token="${escapeHtml(listTokenOf(content))}"`;
 
   if (content.layout === 'v2') {
     const nav = nextHref
@@ -119,7 +124,7 @@ function renderPage(
     return `<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>${heading}</title></head>
-<body data-layout="v2" data-venue="${venue}">
+<body data-layout="v2" data-venue="${venue}" ${meta}>
 <header><h1>${heading}</h1></header>
 <main class="announcement-list">
 ${items.map(renderV2Item).join('\n')}
@@ -135,7 +140,7 @@ ${nav}
   return `<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>${heading}</title></head>
-<body data-layout="legacy" data-venue="${venue}">
+<body data-layout="legacy" data-venue="${venue}" ${meta}>
 <header><h1>${heading}</h1></header>
 <div id="notices" class="old-layout" data-venue="${venue}">
 ${items.map(renderLegacyItem).join('\n')}
@@ -176,6 +181,8 @@ export class MockSite {
   private rateLimit: { seconds: number; remaining: number } | null = null;
   private abortAfter: number | null = null;
   private venueRequestCount = 0;
+  /** 长列表覆盖：venueId → 自定义内容（优先级高于内容版本）。 */
+  private longLists = new Map<string, VenueContent>();
   private readonly stats: MockStats = {
     requests: 0,
     venuePagesServed: 0,
@@ -231,6 +238,13 @@ export class MockSite {
 
   getInfo(): MockStats & { epoch: number; contentVersion: number } {
     return { ...this.stats, epoch: this.epoch, contentVersion: this.contentVersion };
+  }
+
+  /** 某剧场当前对外的完整列表（长列表覆盖优先）。 */
+  contentFor(venueId: string): VenueContent | null {
+    const override = this.longLists.get(venueId);
+    if (override) return override;
+    return venueContent(this.contentVersion, venueId);
   }
 
   private rotateSession(): void {
@@ -305,7 +319,7 @@ export class MockSite {
     }
 
     const venueId = decodeURIComponent((entry ?? paged)![1]);
-    const content = venueContent(this.contentVersion, venueId);
+    const content = this.contentFor(venueId);
     if (!content) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('unknown venue');
@@ -338,13 +352,20 @@ export class MockSite {
 
     if (entry) {
       const { sid, state } = this.sessionFor(req, res);
+      // 入口页支持 ?page=N 深翻续采：会话轮换或新进程没有旧翻页链接时，
+      // 凭当前会话从入口直接取得第 N 页及新的翻页签名。
+      const requested = Number(url.searchParams.get('page') ?? '1');
+      const page =
+        Number.isInteger(requested) && requested >= 1 && requested <= pageCount(content)
+          ? requested
+          : 1;
       const nextHref =
-        pageCount(content) > 1
-          ? `/venue/${venueId}/page/2?sig=${this.signature(sid, state, venueId, 2)}`
+        page < pageCount(content)
+          ? `/venue/${venueId}/page/${page + 1}?sig=${this.signature(sid, state, venueId, page + 1)}`
           : null;
       this.stats.venuePagesServed += 1;
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(renderPage(content, 1, nextHref));
+      res.end(renderPage(content, page, nextHref));
       return;
     }
 
@@ -398,6 +419,7 @@ export class MockSite {
         this.rateLimit = null;
         this.abortAfter = null;
         this.venueRequestCount = 0;
+        this.longLists.clear();
         this.stats.requests = 0;
         this.stats.venuePagesServed = 0;
         this.stats.pagingRecoveries = 0;
@@ -438,8 +460,69 @@ export class MockSite {
             : Number(payload.count);
         response = { ok: true, abortAfter: this.abortAfter };
         break;
+      case 'long-list': {
+        const venueId = String(payload.venue ?? 'grand');
+        const base = venueContent(this.contentVersion, venueId);
+        if (!base) {
+          res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'unknown venue' }));
+          return;
+        }
+        const itemCount = Number(payload.items ?? 128);
+        const long = longVenueContent(
+          venueId,
+          base.layout,
+          Number.isInteger(itemCount) && itemCount > 0 ? itemCount : 128,
+        );
+        this.longLists.set(venueId, long);
+        response = {
+          ok: true,
+          venue: venueId,
+          items: long.items.length,
+          pages: pageCount(long),
+          listToken: listTokenOf(long),
+        };
+        break;
+      }
+      case 'list-edit': {
+        const venueId = String(payload.venue ?? 'grand');
+        const current = this.contentFor(venueId);
+        if (!current) {
+          res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'unknown venue' }));
+          return;
+        }
+        const edit: ListEdit = {
+          prepend: Number(payload.prepend ?? 0) || undefined,
+          removeAt: Array.isArray(payload.removeAt)
+            ? payload.removeAt.map((value) => Number(value))
+            : undefined,
+          swap: Array.isArray(payload.swap) && payload.swap.length === 2
+            ? [Number(payload.swap[0]), Number(payload.swap[1])]
+            : undefined,
+        };
+        const edited = editVenueContent(current, edit);
+        this.longLists.set(venueId, edited);
+        response = {
+          ok: true,
+          venue: venueId,
+          items: edited.items.length,
+          pages: pageCount(edited),
+          listToken: listTokenOf(edited),
+        };
+        break;
+      }
       case 'stats':
-        response = { ok: true, ...this.getInfo() };
+        response = {
+          ok: true,
+          ...this.getInfo(),
+          longLists: [...this.longLists.entries()].map(([venueId, content]) => ({
+            venue: venueId,
+            items: content.items.length,
+            pages: pageCount(content),
+            listToken: listTokenOf(content),
+          })),
+        };
         break;
       default:
         res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });

@@ -2,6 +2,7 @@ import type { AnnouncementRow } from '../core/types';
 import { computeEffective } from '../core/effective';
 import { normalizeDateTime, parseRetryAfter } from '../core/time';
 import { parsePage } from '../parse/parse';
+import { editVenueContent, listTokenOf, longVenueContent, pageCount } from '../mock/content';
 
 export type Check = (name: string, condition: boolean, detail?: string) => void;
 
@@ -184,4 +185,38 @@ export function runUnitChecks(check: Check): void {
     '待补采说明包含来源',
     (pendingEvent.pendingReparseNote ?? '').includes('harbor'),
   );
+
+  // 列表元数据：页码、总页数、列表指纹从 HTML 的 body 属性解析。
+  const pageWithMeta = parsePage(
+    '<html><body data-layout="v2" data-venue="grand" data-page="7" data-page-count="64" data-list-token="tok-123"><main class="announcement-list">' +
+      '<article class="announcement" data-kind="schedule" data-event="E-9" data-revision="1" data-site="x">' +
+      '<h2 class="title">T</h2>' +
+      '<time class="show-time" data-time="2026-12-01 19:00">2026-12-01 19:00</time>' +
+      '<time class="doors-time" data-time="2026-12-01 18:15">2026-12-01 18:15</time></article>' +
+      '</main></body></html>',
+    'http://mock/venue/grand?page=7',
+    7,
+    'grand',
+  );
+  check('解析当前页码', pageWithMeta.pageNo === 7);
+  check('解析总页数', pageWithMeta.pageCount === 64);
+  check('解析列表指纹', pageWithMeta.listToken === 'tok-123');
+
+  // 长列表：128 条 / 每页 2 条 = 64 页（超过 60 页）。
+  const longList = longVenueContent('grand', 'v2', 128);
+  check('长列表超过 60 页', pageCount(longList) === 64 && longList.items.length === 128);
+  const tokenBefore = listTokenOf(longList);
+  check('列表指纹为非空字符串', typeof tokenBefore === 'string' && tokenBefore.length > 0);
+
+  // 重排改变指纹但不改变条目数。
+  const swapped = editVenueContent(longList, { swap: [0, 9] });
+  check('重排不改变条目数', swapped.items.length === longList.items.length);
+  check('重排改变列表指纹', listTokenOf(swapped) !== tokenBefore);
+  check('重排交换了位置', swapped.items[0].siteId === longList.items[9].siteId);
+
+  // 增删：补发改指纹，删除既改指纹又减条目。
+  const prepended = editVenueContent(longList, { prepend: 2 });
+  check('补发增加条目并改变指纹', prepended.items.length === 130 && listTokenOf(prepended) !== tokenBefore);
+  const removed = editVenueContent(longList, { removeAt: [3, 4] });
+  check('删除减少条目并改变指纹', removed.items.length === 126 && listTokenOf(removed) !== tokenBefore);
 }

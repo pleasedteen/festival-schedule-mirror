@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { AnnouncementKind } from '../core/types';
 
 export interface MockItem {
@@ -219,4 +220,98 @@ export function pageCount(content: VenueContent): number {
 export function itemsForPage(content: VenueContent, page: number): MockItem[] {
   const start = (page - 1) * PAGE_SIZE;
   return content.items.slice(start, start + PAGE_SIZE);
+}
+
+/**
+ * 列表指纹：覆盖顺序与每条公告的身份/内容。
+ * 公告增删、重排或正文修订都会改变指纹，采集器据此判断续采游标是否仍然有效。
+ */
+export function listTokenOf(content: VenueContent): string {
+  const digest = createHash('sha256');
+  digest.update(content.venueId);
+  for (const item of content.items) {
+    digest.update('|');
+    digest.update(
+      JSON.stringify([
+        item.siteId,
+        item.kind,
+        item.eventId,
+        item.revision,
+        item.title,
+        item.showTime ?? null,
+        item.doorsTime ?? null,
+        item.fromVenue ?? null,
+        item.toVenue ?? null,
+      ]),
+    );
+  }
+  return digest.digest('hex').slice(0, 16);
+}
+
+/**
+ * 生成超过 60 页的长列表（PAGE_SIZE=2 时 128 条 = 64 页），
+ * 用于验证每进程 30 次列表请求上限下的跨进程续采。
+ */
+export function longVenueContent(
+  venueId: string,
+  layout: 'v2' | 'legacy',
+  itemCount = 128,
+): VenueContent {
+  const items: MockItem[] = Array.from({ length: itemCount }, (_, index) => {
+    const number = index + 1;
+    const day = 1 + (index % 27);
+    const hour = 19;
+    const showTime = `2027-03-${String(day).padStart(2, '0')} ${String(hour).padStart(2, '0')}:00`;
+    const doorsTime = `2027-03-${String(day).padStart(2, '0')} 18:15`;
+    return {
+      siteId: `${venueId}-long-${String(number).padStart(4, '0')}`,
+      kind: 'schedule',
+      eventId: `E-L${String(number).padStart(4, '0')}`,
+      revision: 1,
+      title: `长列表公告 ${number}`,
+      showTime,
+      doorsTime,
+    };
+  });
+  return { venueId, layout, items };
+}
+
+export interface ListEdit {
+  /** 在列表头部插入的新公告数量。 */
+  prepend?: number;
+  /** 删除指定 0 基下标上的公告。 */
+  removeAt?: number[];
+  /** 交换两个 0 基下标上的公告（重排）。 */
+  swap?: [number, number];
+}
+
+/**
+ * 按编辑指令修改某剧场的当前列表，返回修改后的新对象（不就地改入参）。
+ * 增删与重排都会让 listTokenOf 的结果发生变化。
+ */
+export function editVenueContent(content: VenueContent, edit: ListEdit): VenueContent {
+  let items = [...content.items];
+  if (edit.swap) {
+    const [left, right] = edit.swap;
+    if (left >= 0 && right >= 0 && left < items.length && right < items.length) {
+      [items[left], items[right]] = [items[right], items[left]];
+    }
+  }
+  if (edit.removeAt && edit.removeAt.length > 0) {
+    const dropped = new Set(edit.removeAt);
+    items = items.filter((_, index) => !dropped.has(index));
+  }
+  if (edit.prepend && edit.prepend > 0) {
+    const additions: MockItem[] = Array.from({ length: edit.prepend }, (_, index) => ({
+      siteId: `${content.venueId}-added-${Date.now()}-${index}`,
+      kind: 'schedule' as AnnouncementKind,
+      eventId: `E-A${Date.now()}${index}`,
+      revision: 1,
+      title: `临时增补公告 ${index + 1}`,
+      showTime: '2027-04-01 19:00',
+      doorsTime: '2027-04-01 18:15',
+    }));
+    items = [...additions, ...items];
+  }
+  return { venueId: content.venueId, layout: content.layout, items };
 }

@@ -112,6 +112,21 @@ export interface VenueSyncRecord {
   announcements: number;
 }
 
+export interface CollectCursor {
+  venueId: string;
+  listToken: string | null;
+  nextPage: number;
+  totalPages: number | null;
+  /** 本轮遍历的身份；检测到列表变化而从头重走时换一个新值。 */
+  passKey: string;
+  /** 本轮（可跨多个进程）已经采过的页码，只有覆盖 1..totalPages 才允许收敛。 */
+  coveredPages: number[];
+  /** 本轮（可跨多个进程）实际见到的公告键，完成时据此收敛掉站点已撤下的旧公告。 */
+  observedKeys: string[];
+  complete: boolean;
+  updatedAt: string;
+}
+
 export class Store {
   private constructor(
     private readonly instance: DuckDBInstance,
@@ -166,6 +181,36 @@ export class Store {
         announcement_count INTEGER NOT NULL
       )
     `);
+    // 跨进程续采游标：每剧场保存“下一次该从第几页继续”的位置与列表指纹，
+    // 进程重启后凭 ?page=N 从入口重新取得翻页位置；列表变化时指纹失效并从头重走。
+    await this.connection.run(`
+      CREATE TABLE IF NOT EXISTS collect_cursors (
+        venue_id VARCHAR PRIMARY KEY,
+        list_token VARCHAR,
+        next_page INTEGER NOT NULL,
+        total_pages INTEGER,
+        pass_key VARCHAR NOT NULL,
+        covered_pages VARCHAR NOT NULL DEFAULT '[]',
+        observed_keys VARCHAR NOT NULL DEFAULT '[]',
+        complete BOOLEAN NOT NULL,
+        updated_at VARCHAR NOT NULL
+      )
+    `);
+    // 旧库（无 covered_pages / observed_keys 列）平滑升级。
+    const cursorColumns = await this.connection.runAndReadAll(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'collect_cursors'`,
+    );
+    const cursorColumnNames = cursorColumns.getRowObjects().map((record) => String(record.column_name));
+    if (!cursorColumnNames.includes('covered_pages')) {
+      await this.connection.run(
+        `ALTER TABLE collect_cursors ADD COLUMN covered_pages VARCHAR NOT NULL DEFAULT '[]'`,
+      );
+    }
+    if (!cursorColumnNames.includes('observed_keys')) {
+      await this.connection.run(
+        `ALTER TABLE collect_cursors ADD COLUMN observed_keys VARCHAR NOT NULL DEFAULT '[]'`,
+      );
+    }
     // 派生表：服务台对外唯一使用的“已确认排期”。
     // 按编号查询与按剧场查询都只读这两张表，避免各自重算产生分歧。
     await this.connection.run(`
@@ -375,6 +420,90 @@ export class Store {
       lastError: asString(record.last_error),
       announcements: Number(record.announcement_count),
     }));
+  }
+
+  async getCollectCursor(venueId: string): Promise<CollectCursor | null> {
+    const reader = await this.connection.runAndReadAll(
+      `SELECT * FROM collect_cursors WHERE venue_id = ?`,
+      [venueId],
+    );
+    const rows = reader.getRowObjects();
+    if (rows.length === 0) return null;
+    const record = rows[0];
+    let coveredPages: number[] = [];
+    try {
+      const parsed = JSON.parse(asString(record.covered_pages) ?? '[]');
+      if (Array.isArray(parsed)) coveredPages = parsed.map((value) => Number(value)).filter(Number.isInteger);
+    } catch {
+      coveredPages = [];
+    }
+    let observedKeys: string[] = [];
+    try {
+      const parsed = JSON.parse(asString(record.observed_keys) ?? '[]');
+      if (Array.isArray(parsed)) observedKeys = parsed.map((value) => String(value));
+    } catch {
+      observedKeys = [];
+    }
+    return {
+      venueId: String(record.venue_id),
+      listToken: asString(record.list_token),
+      nextPage: Number(record.next_page),
+      totalPages: asNumber(record.total_pages),
+      passKey: String(record.pass_key),
+      coveredPages,
+      observedKeys,
+      complete: Boolean(record.complete),
+      updatedAt: String(record.updated_at),
+    };
+  }
+
+  async saveCollectCursor(cursor: CollectCursor): Promise<void> {
+    await this.connection.run(
+      `INSERT INTO collect_cursors
+         (venue_id, list_token, next_page, total_pages, pass_key, covered_pages, observed_keys, complete, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (venue_id) DO UPDATE SET
+         list_token = excluded.list_token,
+         next_page = excluded.next_page,
+         total_pages = excluded.total_pages,
+         pass_key = excluded.pass_key,
+         covered_pages = excluded.covered_pages,
+         observed_keys = excluded.observed_keys,
+         complete = excluded.complete,
+         updated_at = excluded.updated_at`,
+      [
+        cursor.venueId,
+        cursor.listToken,
+        cursor.nextPage,
+        cursor.totalPages,
+        cursor.passKey,
+        JSON.stringify([...new Set(cursor.coveredPages)].sort((a, b) => a - b)),
+        JSON.stringify([...new Set(cursor.observedKeys)]),
+        cursor.complete,
+        cursor.updatedAt,
+      ],
+    );
+  }
+
+  async clearCollectCursor(venueId: string): Promise<void> {
+    await this.connection.run(`DELETE FROM collect_cursors WHERE venue_id = ?`, [venueId]);
+  }
+
+  /**
+   * 一轮完整遍历结束时，把该剧场的公告收敛到“本轮实际采到的一份完整列表”：
+   * 删掉本轮没再出现的旧公告（站点已撤下或重排产生的陈旧数据），
+   * 未完成的遍历不会调用这里，所以采集中途的查询始终仍能看到已采排期。
+   */
+  async pruneVenueAnnouncements(venueId: string, keepKeys: string[]): Promise<number> {
+    const keep = new Set(keepKeys);
+    const rows = await this.allAnnouncements();
+    const stale = rows.filter(
+      (row) => row.venueId === venueId && !keep.has(row.annKey),
+    );
+    for (const row of stale) {
+      await this.connection.run(`DELETE FROM announcements WHERE ann_key = ?`, [row.annKey]);
+    }
+    return stale.length;
   }
 
   /**

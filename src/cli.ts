@@ -19,6 +19,8 @@ function usage(): void {
 
   node dist/cli.js collect [--site URL] [--db PATH] [--venue ID ...]
       采集各剧场公告并写入 DuckDB
+      退出码：0 全部采齐；3 有剧场未完成（到达每进程 30 次请求上限，可续采）；
+              1 有剧场失败；2 参数错误
 
   node dist/cli.js query event <演出编号> [--db PATH]
   node dist/cli.js query venue <剧场代码> [--db PATH]
@@ -99,12 +101,20 @@ async function cmdCollect(args: Args): Promise<number> {
     const result = await collector.collectAll(venues);
     console.log('');
     for (const venue of result.venues) {
-      const mark = venue.ok ? '✓' : '✗';
+      const mark = venue.status === 'complete' ? '✓' : venue.status === 'incomplete' ? '◐' : '✗';
+      const stateLabel =
+        venue.status === 'complete'
+          ? '完成'
+          : venue.status === 'incomplete'
+            ? `未完成（续采于第 ${venue.nextPage ?? '?'} 页）`
+            : '失败';
       console.log(
         `${mark} ${venue.venueId}（${venueName(venue.venueId)}）` +
-          ` 版式 ${venue.layout ?? '-'} 页数 ${venue.pages}` +
+          ` 状态 ${stateLabel} 版式 ${venue.layout ?? '-'} 页数 ${venue.pages}` +
+          ` 请求 ${venue.requests}/${venue.requestBudget}` +
           ` 公告 ${venue.announcements} 条 待补采 ${venue.pending}` +
           ` 翻页恢复 ${venue.recoveries} 次 限流等待 ${venue.rateLimitWaits} 次` +
+          (venue.pruned ? ` 收敛移除 ${venue.pruned} 条` : '') +
           (venue.error ? ` 错误：${venue.error}` : ''),
       );
     }
@@ -117,7 +127,10 @@ async function cmdCollect(args: Args): Promise<number> {
         console.log(`  - ${row.venueId} ${row.sourceUrl}（${row.parseError ?? '解析失败'}）`);
       }
     }
-    return result.venues.every((venue) => venue.ok) ? 0 : 1;
+    if (result.venues.some((venue) => venue.status === 'failed')) return 1;
+    // 未完成不是失败：已采排期照常可查，退出码 3 与“完成（0）/失败（1）”区分。
+    if (result.venues.some((venue) => venue.status === 'incomplete')) return 3;
+    return 0;
   });
 }
 
@@ -235,9 +248,12 @@ async function cmdRepair(args: Args): Promise<number> {
     const result = await collector.collectAll(venues);
     const remaining = await desk.pendingReparse();
     console.log(
-      `补采完成：${result.venues.map((venue) => `${venue.venueId} ${venue.ok ? '成功' : '失败'}`).join('，')}`,
+      `补采完成：${result.venues
+        .map((venue) => `${venue.venueId} ${venue.status === 'complete' ? '完成' : venue.status === 'incomplete' ? '未完成' : '失败'}`)
+        .join('，')}`,
     );
     console.log(`剩余待补采 ${remaining.length} 条`);
+    if (result.venues.some((venue) => venue.status === 'failed')) return 1;
     return remaining.length === 0 ? 0 : 1;
   });
 }

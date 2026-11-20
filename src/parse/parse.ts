@@ -315,10 +315,16 @@ export function parsePage(
     announcements.push(parsed);
   });
 
+  const bodyPage = Number($('body').attr('data-page'));
+  const bodyPageCount = Number($('body').attr('data-page-count'));
   return {
     layout,
     announcements,
     nextUrl: nextUrlOf($, sourceUrl, layout),
     pageLabel: textOf($('.page-label').first().text()),
+    pageNo: Number.isInteger(bodyPage) && bodyPage > 0 ? bodyPage : page,
+    pageCount:
+      Number.isInteger(bodyPageCount) && bodyPageCount > 0 ? bodyPageCount : null,
+    listToken: textOf($('body').attr('data-list-token')),
   };
 }
