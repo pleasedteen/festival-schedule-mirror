@@ -104,10 +104,14 @@ async function cmdCollect(args: Args): Promise<number> {
         `${mark} ${venue.venueId}（${venueName(venue.venueId)}）` +
           ` 版式 ${venue.layout ?? '-'} 页数 ${venue.pages}` +
           ` 公告 ${venue.announcements} 条 待补采 ${venue.pending}` +
+          ` 正文传输 ${venue.bodyTransferred} 页 / 304 跳过 ${venue.notModified} 页` +
           ` 翻页恢复 ${venue.recoveries} 次 限流等待 ${venue.rateLimitWaits} 次` +
           (venue.error ? ` 错误：${venue.error}` : ''),
       );
     }
+    console.log(
+      `\n本轮正文传输合计 ${result.bodyTransferred} 页，条件命中（304）${result.notModified} 页`,
+    );
     const desk = new FestivalDesk(store);
     const pending = await desk.pendingReparse();
     if (pending.length > 0) {

@@ -220,3 +220,16 @@ export function itemsForPage(content: VenueContent, page: number): MockItem[] {
   const start = (page - 1) * PAGE_SIZE;
   return content.items.slice(start, start + PAGE_SIZE);
 }
+
+/**
+ * 条件采集用的页面内容指纹：只取决于该页公告内容与版式，
+ * 不包含会话/签名等易变信息，因此站点重启或会话轮换后指纹保持不变。
+ */
+export function pageFingerprint(content: VenueContent, page: number): string {
+  return JSON.stringify({
+    venueId: content.venueId,
+    layout: content.layout,
+    page,
+    items: itemsForPage(content, page).map((item) => ({ ...item })),
+  });
+}

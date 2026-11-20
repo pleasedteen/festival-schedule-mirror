@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import http from 'node:http';
 import { AddressInfo } from 'node:net';
 import { VENUES } from '../venues';
@@ -6,6 +6,7 @@ import {
   PAGE_SIZE,
   itemsForPage,
   pageCount,
+  pageFingerprint,
   venueContent,
   type MockItem,
   type VenueContent,
@@ -19,6 +20,8 @@ interface SessionState {
 interface MockStats {
   requests: number;
   venuePagesServed: number;
+  bodyTransferred: number;
+  notModified: number;
   pagingRecoveries: number;
   rateLimited: number;
   aborted: number;
@@ -176,9 +179,16 @@ export class MockSite {
   private rateLimit: { seconds: number; remaining: number } | null = null;
   private abortAfter: number | null = null;
   private venueRequestCount = 0;
+  /**
+   * 测试用追加公告：按剧场叠加在基础内容之后，模拟“旧末页之后又新增一页”。
+   * 仅保存在内存里；/_control/reset 会清空，重启站点也不会保留。
+   */
+  private extraItems = new Map<string, MockItem[]>();
   private readonly stats: MockStats = {
     requests: 0,
     venuePagesServed: 0,
+    bodyTransferred: 0,
+    notModified: 0,
     pagingRecoveries: 0,
     rateLimited: 0,
     aborted: 0,
@@ -231,6 +241,53 @@ export class MockSite {
 
   getInfo(): MockStats & { epoch: number; contentVersion: number } {
     return { ...this.stats, epoch: this.epoch, contentVersion: this.contentVersion };
+  }
+
+  /** 当前生效的剧场内容（基础版本 + 测试追加公告）。 */
+  private contentFor(venueId: string): VenueContent | null {
+    const base = venueContent(this.contentVersion, venueId);
+    if (!base) return null;
+    const extra = this.extraItems.get(venueId);
+    if (!extra || extra.length === 0) return base;
+    return { ...base, items: [...base.items, ...extra] };
+  }
+
+  /**
+   * 页面 ETag：只对页面公告内容做哈希，与会话/翻页签名无关，
+   * 所以站点重启、会话轮换后同一页面仍是同一个 ETag。
+   */
+  private etagFor(content: VenueContent, page: number): string {
+    const digest = createHash('sha256')
+      .update(pageFingerprint(content, page))
+      .digest('hex')
+      .slice(0, 24);
+    return `"${content.venueId}-p${page}-${digest}"`;
+  }
+
+  /**
+   * 304 响应没有正文，翻页位置通过响应头继续下发；
+   * 200 响应也带同样的头，采集器可以用同一条路径取得下一页。
+   */
+  private pageHeaders(
+    sid: string,
+    state: SessionState,
+    content: VenueContent,
+    page: number,
+    etag: string,
+  ): Record<string, string> {
+    const total = pageCount(content);
+    const headers: Record<string, string> = {
+      'content-type': 'text/html; charset=utf-8',
+      etag,
+      'x-page': String(page),
+      'x-page-total': String(total),
+    };
+    if (page < total) {
+      headers['x-next-href'] =
+        `/venue/${content.venueId}/page/${page + 1}?sig=${this.signature(sid, state, content.venueId, page + 1)}`;
+      headers['x-next-page'] = String(page + 1);
+    }
+    return headers;
   }
 
   private rotateSession(): void {
@@ -305,7 +362,7 @@ export class MockSite {
     }
 
     const venueId = decodeURIComponent((entry ?? paged)![1]);
-    const content = venueContent(this.contentVersion, venueId);
+    const content = this.contentFor(venueId);
     if (!content) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('unknown venue');
@@ -338,13 +395,19 @@ export class MockSite {
 
     if (entry) {
       const { sid, state } = this.sessionFor(req, res);
-      const nextHref =
-        pageCount(content) > 1
-          ? `/venue/${venueId}/page/2?sig=${this.signature(sid, state, venueId, 2)}`
-          : null;
+      const etag = this.etagFor(content, 1);
+      const headers = this.pageHeaders(sid, state, content, 1, etag);
       this.stats.venuePagesServed += 1;
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(renderPage(content, 1, nextHref));
+      if (req.headers['if-none-match'] === etag) {
+        // 条件命中：不回传正文，翻页位置仍通过响应头提供。
+        this.stats.notModified += 1;
+        res.writeHead(304, headers);
+        res.end();
+        return;
+      }
+      this.stats.bodyTransferred += 1;
+      res.writeHead(200, headers);
+      res.end(renderPage(content, 1, headers['x-next-href'] ?? null));
       return;
     }
 
@@ -371,13 +434,19 @@ export class MockSite {
       return;
     }
 
-    const nextHref =
-      page < pageCount(content)
-        ? `/venue/${venueId}/page/${page + 1}?sig=${this.signature(sid!, state!, venueId, page + 1)}`
-        : null;
+    const etag = this.etagFor(content, page);
+    const headers = this.pageHeaders(sid!, state!, content, page, etag);
     this.stats.venuePagesServed += 1;
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(renderPage(content, page, nextHref));
+    if (req.headers['if-none-match'] === etag) {
+      // 会话轮换或重启后只要内容未变，旧 ETag 仍命中，正文不再回传。
+      this.stats.notModified += 1;
+      res.writeHead(304, headers);
+      res.end();
+      return;
+    }
+    this.stats.bodyTransferred += 1;
+    res.writeHead(200, headers);
+    res.end(renderPage(content, page, headers['x-next-href'] ?? null));
   }
 
   private async handleControl(
@@ -398,8 +467,11 @@ export class MockSite {
         this.rateLimit = null;
         this.abortAfter = null;
         this.venueRequestCount = 0;
+        this.extraItems.clear();
         this.stats.requests = 0;
         this.stats.venuePagesServed = 0;
+        this.stats.bodyTransferred = 0;
+        this.stats.notModified = 0;
         this.stats.pagingRecoveries = 0;
         this.stats.rateLimited = 0;
         this.stats.aborted = 0;
@@ -412,6 +484,42 @@ export class MockSite {
         this.contentVersion = Number(payload.version ?? this.contentVersion);
         response = { ok: true, contentVersion: this.contentVersion };
         break;
+      case 'append-item': {
+        // 测试用：向指定剧场追加一条公告，制造“旧末页之后新增下一页”。
+        const venue = String(payload.venue ?? '');
+        const base = venueContent(this.contentVersion, venue);
+        if (!base) {
+          res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'unknown venue' }));
+          return;
+        }
+        const item: MockItem = {
+          siteId: String(payload.siteId ?? `extra-${Date.now()}`),
+          kind: String(payload.kind ?? 'schedule') as MockItem['kind'],
+          eventId: String(payload.eventId ?? 'E-EXTRA'),
+          revision: Number(payload.revision ?? 1),
+          title: String(payload.title ?? '追加公告'),
+          showTime:
+            payload.showTime === undefined ? undefined : String(payload.showTime),
+          doorsTime:
+            payload.doorsTime === undefined ? undefined : String(payload.doorsTime),
+          fromVenue:
+            payload.fromVenue === undefined ? undefined : String(payload.fromVenue),
+          toVenue:
+            payload.toVenue === undefined ? undefined : String(payload.toVenue),
+        };
+        const extra = this.extraItems.get(venue) ?? [];
+        extra.push(item);
+        this.extraItems.set(venue, extra);
+        const merged = this.contentFor(venue)!;
+        response = {
+          ok: true,
+          venue,
+          items: merged.items.length,
+          pages: pageCount(merged),
+        };
+        break;
+      }
       case 'session/rotate':
         this.rotateSession();
         response = { ok: true, epoch: this.epoch };

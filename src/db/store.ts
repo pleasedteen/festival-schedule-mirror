@@ -110,6 +110,7 @@ export interface VenueSyncRecord {
   status: string;
   lastError: string | null;
   announcements: number;
+  layout: string | null;
 }
 
 export class Store {
@@ -163,9 +164,20 @@ export class Store {
         rate_limit_waits INTEGER NOT NULL,
         status VARCHAR NOT NULL,
         last_error VARCHAR,
-        announcement_count INTEGER NOT NULL
+        announcement_count INTEGER NOT NULL,
+        layout VARCHAR
       )
     `);
+    // 旧库升级：venue_sync 早期没有 layout 列。
+    const syncColumns = await this.connection.runAndReadAll(
+      "PRAGMA table_info('venue_sync')",
+    );
+    const hasLayout = syncColumns
+      .getRowObjects()
+      .some((record) => String(record.name) === 'layout');
+    if (!hasLayout) {
+      await this.connection.run('ALTER TABLE venue_sync ADD COLUMN layout VARCHAR');
+    }
     // 派生表：服务台对外唯一使用的“已确认排期”。
     // 按编号查询与按剧场查询都只读这两张表，避免各自重算产生分歧。
     await this.connection.run(`
@@ -204,6 +216,18 @@ export class Store {
         received_to BOOLEAN NOT NULL,
         note VARCHAR,
         PRIMARY KEY (event_id, revision)
+      )
+    `);
+    // 条件采集状态：每个剧场每一页最近一次“已入库正文”的 ETag。
+    // 只有正文成功入库后才写入，因此“下载后未入库即中断”的页面
+    // 不会留下 ETag，下次续采会重新拉取该页正文。
+    await this.connection.run(`
+      CREATE TABLE IF NOT EXISTS page_states (
+        venue_id VARCHAR NOT NULL,
+        source_page INTEGER NOT NULL,
+        etag VARCHAR NOT NULL,
+        updated_at VARCHAR NOT NULL,
+        PRIMARY KEY (venue_id, source_page)
       )
     `);
     await this.selfHealEffective();
@@ -251,54 +275,64 @@ export class Store {
     changed: number;
     unchanged: number;
   }> {
+    await this.connection.run('BEGIN TRANSACTION');
+    try {
+      const result = await this.writePageItems(items, now);
+      await this.connection.run('COMMIT');
+      return result;
+    } catch (error) {
+      await this.connection.run('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * 正文入库与页面 ETag 落库放在同一个事务里：
+   * 只有正文确认写入后，条件采集状态才会更新；
+   * 事务失败 / 进程中断时两者一起回滚，下次续采会重新拉取该页。
+   */
+  async upsertPageWithState(
+    items: AnnouncementInput[],
+    venueId: string,
+    sourcePage: number,
+    etag: string,
+    now: string,
+  ): Promise<{ inserted: number; changed: number; unchanged: number }> {
+    await this.connection.run('BEGIN TRANSACTION');
+    try {
+      const result = await this.writePageItems(items, now);
+      await this.connection.run(
+        `INSERT INTO page_states (venue_id, source_page, etag, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (venue_id, source_page) DO UPDATE SET
+           etag = excluded.etag,
+           updated_at = excluded.updated_at`,
+        [venueId, sourcePage, etag, now],
+      );
+      await this.connection.run('COMMIT');
+      return result;
+    } catch (error) {
+      await this.connection.run('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /** 调用方负责包裹事务。 */
+  private async writePageItems(
+    items: AnnouncementInput[],
+    now: string,
+  ): Promise<{ inserted: number; changed: number; unchanged: number }> {
     let inserted = 0;
     let changed = 0;
     let unchanged = 0;
-    await this.connection.run('BEGIN TRANSACTION');
-    try {
-      for (const item of items) {
-        const current = await this.existing(item.annKey);
-        const sourceUrl = canonicalUrl(item.sourceUrl);
-        if (!current) {
-          await this.connection.run(
-            `INSERT INTO announcements (${COLUMNS.join(', ')}) VALUES (${COLUMNS.map(() => '?').join(', ')})`,
-            [
-              item.annKey,
-              item.venueId,
-              item.siteId,
-              item.kind,
-              item.eventId,
-              item.revision,
-              item.title,
-              item.showTime,
-              item.doorsTime,
-              item.fromVenue,
-              item.toVenue,
-              sourceUrl,
-              item.sourcePage,
-              item.layout,
-              item.rawHtml,
-              item.parseStatus,
-              item.parseError,
-              now,
-              now,
-            ],
-          );
-          inserted += 1;
-          continue;
-        }
-        if (signatureOf(current) === signatureOf(item)) {
-          unchanged += 1;
-          continue;
-        }
+    for (const item of items) {
+      const current = await this.existing(item.annKey);
+      const sourceUrl = canonicalUrl(item.sourceUrl);
+      if (!current) {
         await this.connection.run(
-          `UPDATE announcements SET
-             venue_id = ?, site_id = ?, kind = ?, event_id = ?, revision = ?,
-             title = ?, show_time = ?, doors_time = ?, from_venue = ?, to_venue = ?,
-             source_url = ?, source_page = ?, layout = ?, raw_html = ?,
-             parse_status = ?, parse_error = ?, updated_at = ?
-           WHERE ann_key = ?`,
+          `INSERT INTO announcements (${COLUMNS.join(', ')}) VALUES (${COLUMNS.map(() => '?').join(', ')})`,
           [
+            item.annKey,
             item.venueId,
             item.siteId,
             item.kind,
@@ -309,24 +343,73 @@ export class Store {
             item.doorsTime,
             item.fromVenue,
             item.toVenue,
-            canonicalUrl(item.sourceUrl),
+            sourceUrl,
             item.sourcePage,
             item.layout,
             item.rawHtml,
             item.parseStatus,
             item.parseError,
             now,
-            item.annKey,
+            now,
           ],
         );
-        changed += 1;
+        inserted += 1;
+        continue;
       }
-      await this.connection.run('COMMIT');
-    } catch (error) {
-      await this.connection.run('ROLLBACK');
-      throw error;
+      if (signatureOf(current) === signatureOf(item)) {
+        unchanged += 1;
+        continue;
+      }
+      await this.connection.run(
+        `UPDATE announcements SET
+           venue_id = ?, site_id = ?, kind = ?, event_id = ?, revision = ?,
+           title = ?, show_time = ?, doors_time = ?, from_venue = ?, to_venue = ?,
+           source_url = ?, source_page = ?, layout = ?, raw_html = ?,
+           parse_status = ?, parse_error = ?, updated_at = ?
+         WHERE ann_key = ?`,
+        [
+          item.venueId,
+          item.siteId,
+          item.kind,
+          item.eventId,
+          item.revision,
+          item.title,
+          item.showTime,
+          item.doorsTime,
+          item.fromVenue,
+          item.toVenue,
+          canonicalUrl(item.sourceUrl),
+          item.sourcePage,
+          item.layout,
+          item.rawHtml,
+          item.parseStatus,
+          item.parseError,
+          now,
+          item.annKey,
+        ],
+      );
+      changed += 1;
     }
     return { inserted, changed, unchanged };
+  }
+
+  /** 某剧场全部已入库页面的 ETag（venueId → page → etag）。 */
+  async pageStates(
+    venueId?: string,
+  ): Promise<{ venueId: string; sourcePage: number; etag: string }[]> {
+    const reader = venueId
+      ? await this.connection.runAndReadAll(
+          'SELECT venue_id, source_page, etag FROM page_states WHERE venue_id = ? ORDER BY source_page',
+          [venueId],
+        )
+      : await this.connection.runAndReadAll(
+          'SELECT venue_id, source_page, etag FROM page_states ORDER BY venue_id, source_page',
+        );
+    return reader.getRowObjects().map((record) => ({
+      venueId: String(record.venue_id),
+      sourcePage: Number(record.source_page),
+      etag: String(record.etag),
+    }));
   }
 
   async pendingAnnouncements(): Promise<AnnouncementRow[]> {
@@ -338,8 +421,8 @@ export class Store {
 
   async recordVenueSync(record: VenueSyncRecord): Promise<void> {
     await this.connection.run(
-      `INSERT INTO venue_sync (venue_id, last_run_at, pages, recoveries, rate_limit_waits, status, last_error, announcement_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO venue_sync (venue_id, last_run_at, pages, recoveries, rate_limit_waits, status, last_error, announcement_count, layout)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (venue_id) DO UPDATE SET
          last_run_at = excluded.last_run_at,
          pages = excluded.pages,
@@ -347,7 +430,8 @@ export class Store {
          rate_limit_waits = excluded.rate_limit_waits,
          status = excluded.status,
          last_error = excluded.last_error,
-         announcement_count = excluded.announcement_count`,
+         announcement_count = excluded.announcement_count,
+         layout = COALESCE(excluded.layout, venue_sync.layout)`,
       [
         record.venueId,
         record.runAt,
@@ -357,6 +441,7 @@ export class Store {
         record.status,
         record.lastError,
         record.announcements,
+        record.layout,
       ],
     );
   }
@@ -374,6 +459,7 @@ export class Store {
       status: String(record.status),
       lastError: asString(record.last_error),
       announcements: Number(record.announcement_count),
+      layout: asString(record.layout),
     }));
   }
 
