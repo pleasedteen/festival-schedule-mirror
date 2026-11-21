@@ -252,8 +252,134 @@ export async function runE2E(): Promise<number> {
       `编号：${byEvent?.venueId} ${byEvent?.showTime}；剧场：${byVenue?.venueId} ${byVenue?.showTime}`,
     );
 
-    /* ---------- 7. 输出最终排期 ---------- */
-    harness.section('7. 最终对外排期');
+    /* ---------- 7. 摘要列表：限额续采、会话轮换与详情错配 ---------- */
+    harness.section('7. 摘要列表剧场：详情限额续采、会话轮换与详情错配');
+    // 环形剧场的列表只给编号/修订/详情入口；先注入“详情与列表不符”的正文，
+    // 并把本轮详情额度限为 2：额度用完后仍要翻完列表，正文下轮续采。
+    await control(site, 'detail-mismatch', {
+      siteId: 'r-1011-s2',
+      eventId: 'E-1011',
+      revision: 1,
+      showTime: '2026-12-31 19:30',
+      doorsTime: '2026-12-31 18:45',
+    });
+    await control(site, 'detail-quota', { count: 2 });
+    const round1 = await collect(store, site, ['ring']);
+    const ring1 = round1.venues[0];
+    harness.check('摘要列表采集完成且翻完 3 页', ring1.ok && ring1.pages === 3, `版式 ${ring1.layout}，${ring1.pages} 页`);
+    harness.equal('摘要列表版式识别', ring1.layout, 'stub');
+    harness.check('详情额度用完（403）', ring1.quotaExhausted === true);
+    harness.check('额度内优先取回最新修订正文', ring1.detailsFetched === 1, `已取 ${ring1.detailsFetched} 条`);
+    harness.check('错配详情被驳回', ring1.detailMismatches === 1, `错配 ${ring1.detailMismatches} 条`);
+    harness.equal('仍有 4 条正文待补采', ring1.detailsPending, 4);
+    desk = new FestivalDesk(store);
+    const e1004r1 = await desk.findEvent('E-1004');
+    harness.check(
+      'E-1004 按最新修订 2 确认（新旧修订分布在不同列表页）',
+      e1004r1?.status === 'scheduled' &&
+        e1004r1?.revision === 2 &&
+        e1004r1?.showTime === '2026-12-29 20:00',
+      describe(e1004r1),
+    );
+    const e1011r1 = await desk.findEvent('E-1011');
+    harness.check(
+      'E-1011 详情错配：编号/修订不符的正文不更新排期',
+      e1011r1?.status === 'pending_reparse' && (e1011r1?.pendingReparseNote ?? '').includes('不符'),
+      e1011r1?.pendingReparseNote ?? '',
+    );
+    const e1006r1 = await desk.findEvent('E-1006');
+    harness.equal('E-1006 额度用尽未取正文，进入待补采', e1006r1?.status, 'pending_reparse');
+    harness.equal('待补采公告共 4 条', (await desk.pendingReparse()).length, 4);
+    const statsRound1 = await control(site, 'stats');
+    harness.check(
+      '站点确认详情额度被用完',
+      Number(statsRound1.detailQuotaExhausted) >= 1,
+      `403 × ${statsRound1.detailQuotaExhausted}，详情服务 ${statsRound1.detailRequests} 次`,
+    );
+
+    // 重启后欠缺的正文仍在待补采；新一轮额度恢复后续采，
+    // 并在首个详情请求时轮换会话：旧签名详情链接返回 409，采集器重翻列表续采。
+    await store.close();
+    store = await Store.open(dbPath);
+    desk = new FestivalDesk(store);
+    const e1004Restart = await desk.findEvent('E-1004');
+    harness.check(
+      '重启后已确认排期保留（E-1004 仍为修订 2）',
+      e1004Restart?.status === 'scheduled' && e1004Restart?.revision === 2,
+      describe(e1004Restart),
+    );
+    const e1006Restart = await desk.findEvent('E-1006');
+    harness.equal('重启后未取到的正文仍可补采', e1006Restart?.status, 'pending_reparse');
+
+    await control(site, 'detail-mismatch', { siteId: 'r-1011-s2', clear: true });
+    await control(site, 'detail-quota', { count: 10 });
+    // 第 4 个请求（首个详情）触发会话轮换。
+    await control(site, 'rotate-after', { count: 4 });
+    const statsBeforeRound2 = await control(site, 'stats');
+    const round2 = await collect(store, site, ['ring']);
+    const ring2 = round2.venues[0];
+    harness.check('换页续采完成', ring2.ok === true, ring2.error ?? '');
+    harness.check('会话轮换后重翻列表取得新详情链接', ring2.recoveries >= 1, `恢复 ${ring2.recoveries} 次`);
+    harness.check('欠缺的 4 条正文全部续采入库', ring2.detailsFetched === 4, `已取 ${ring2.detailsFetched} 条`);
+    harness.check('本轮额度充足未再触发 403', ring2.quotaExhausted === false);
+    const statsRound2 = await control(site, 'stats');
+    harness.check(
+      '站点在详情拉取期间轮换了会话',
+      Number(statsRound2.sessionRotations) > Number(statsBeforeRound2.sessionRotations),
+      `轮换 ${statsBeforeRound2.sessionRotations} → ${statsRound2.sessionRotations} 次`,
+    );
+    desk = new FestivalDesk(store);
+    const e1004After = await desk.findEvent('E-1004');
+    harness.check(
+      '迟到的旧修订正文不把排期改回去（E-1004 仍为修订 2）',
+      e1004After?.status === 'scheduled' &&
+        e1004After?.revision === 2 &&
+        e1004After?.showTime === '2026-12-29 20:00',
+      describe(e1004After),
+    );
+    const e1006After = await desk.findEvent('E-1006');
+    harness.check(
+      'E-1006 续采后进入有效排期',
+      e1006After?.status === 'scheduled' && e1006After?.venueId === 'ring',
+      describe(e1006After),
+    );
+    const e1011After = await desk.findEvent('E-1011');
+    harness.check(
+      'E-1011 错配修复后按修订 2 确认',
+      e1011After?.status === 'scheduled' &&
+        e1011After?.revision === 2 &&
+        e1011After?.showTime === '2026-12-31 20:30',
+      describe(e1011After),
+    );
+    const e1012After = await desk.findEvent('E-1012');
+    harness.check(
+      '详情正文中的改场公告沿用双端确认规则（仅原剧场端 → 待确认）',
+      e1012After?.status === 'pending' &&
+        e1012After?.hasPendingChange === true &&
+        (e1012After?.pendingNote ?? '').includes('ring'),
+      e1012After?.pendingNote ?? '',
+    );
+    const ringSchedule = await desk.venueSchedule('ring');
+    harness.check(
+      '环形剧场有效排期只含已确认场次',
+      ['E-1004', 'E-1006', 'E-1011'].every((id) =>
+        ringSchedule.some((event) => event.eventId === id),
+      ) && !ringSchedule.some((event) => event.eventId === 'E-1012'),
+      ringSchedule.map((event) => event.eventId).join(', '),
+    );
+    const e1011ByVenue = ringSchedule.find((event) => event.eventId === 'E-1011');
+    harness.check(
+      '摘要列表剧场同样保证按编号与按剧场查询一致',
+      e1011ByVenue?.showTime === e1011After?.showTime &&
+        e1011ByVenue?.doorsTime === e1011After?.doorsTime,
+      `编号：${e1011After?.showTime}；剧场：${e1011ByVenue?.showTime}`,
+    );
+    harness.equal('正文全部取回，待补采清空', (await desk.pendingReparse()).length, 0);
+    await control(site, 'rotate-after', { count: 0 });
+    await control(site, 'detail-quota', { count: null });
+
+    /* ---------- 8. 输出最终排期 ---------- */
+    harness.section('8. 最终对外排期');
     const events = await desk.effectiveEvents();
     for (const event of events) console.log(`  ${formatEventLine(event)}`);
     console.log('  改场记录：');
@@ -261,8 +387,8 @@ export async function runE2E(): Promise<number> {
       console.log(`    ${formatConfirmation(confirmation)}`);
     }
 
-    /* ---------- 8. 单元级边界检查 ---------- */
-    harness.section('8. 解析与折叠边界');
+    /* ---------- 9. 单元级边界检查 ---------- */
+    harness.section('9. 解析与折叠边界');
     runUnitChecks((name, condition, detail) =>
       harness.check(name, condition, detail),
     );

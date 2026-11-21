@@ -71,6 +71,47 @@ export function runUnitChecks(check: Check): void {
   }
   check('无法识别版式时明确报错', unknownLayout);
 
+  const stubPage = parsePage(
+    '<html><body data-layout="stub" data-venue="ring"><main class="announcement-index">' +
+      '<article class="entry" data-event="E-7" data-revision="2" data-site="r-7-s2">' +
+      '<span class="code">E-7</span> <span class="rev">修订 2</span> ' +
+      '<a class="detail-link" href="/venue/ring/detail/r-7-s2?sig=abc">详情</a></article>' +
+      '</main><nav class="pager"><a rel="next" href="/venue/ring/page/2?sig=n1">下一页</a></nav></body></html>',
+    'http://mock/venue/ring',
+    1,
+    'ring',
+  );
+  const stubItem = stubPage.announcements[0];
+  check('摘要列表版式识别', stubPage.layout === 'stub');
+  check(
+    '摘要条目只带编号与修订、进入待补采',
+    stubItem.parseStatus === 'pending' &&
+      stubItem.eventId === 'E-7' &&
+      stubItem.revision === 2 &&
+      stubItem.kind === null,
+  );
+  check(
+    '摘要条目解析出详情入口',
+    stubItem.detailUrl === 'http://mock/venue/ring/detail/r-7-s2?sig=abc',
+  );
+  check(
+    '摘要列表继续翻页',
+    stubPage.nextUrl === 'http://mock/venue/ring/page/2?sig=n1',
+  );
+  const stubNoLink = parsePage(
+    '<html><body data-layout="stub" data-venue="ring"><main class="announcement-index">' +
+      '<article class="entry" data-event="E-8" data-revision="1" data-site="r-8-s1"></article>' +
+      '</main></body></html>',
+    'http://mock/venue/ring',
+    1,
+    'ring',
+  );
+  check(
+    '缺少详情入口的摘要条目保持待补采',
+    stubNoLink.announcements[0].parseStatus === 'pending' &&
+      stubNoLink.announcements[0].detailUrl === null,
+  );
+
   const base = row({
     annKey: 'g:base',
     venueId: 'grand',
@@ -167,6 +208,30 @@ export function runUnitChecks(check: Check): void {
   check(
     '低修订号不会覆盖已确认排期',
     noRegress.venueId === 'studio' && noRegress.revision === 2,
+  );
+
+  const revisedSchedule = row({
+    annKey: 'r:rev2',
+    venueId: 'ring',
+    kind: 'schedule',
+    eventId: 'E-Z',
+    revision: 2,
+    showTime: '2026-12-29 20:00',
+    doorsTime: '2026-12-29 19:15',
+  });
+  const lateOldBody = row({
+    annKey: 'r:rev1',
+    venueId: 'ring',
+    kind: 'schedule',
+    eventId: 'E-Z',
+    revision: 1,
+    showTime: '2026-12-29 19:30',
+    doorsTime: '2026-12-29 18:45',
+  });
+  const notReverted = computeEffective([revisedSchedule, lateOldBody]).events[0];
+  check(
+    '迟到的旧修订正文不把排期改回去',
+    notReverted.revision === 2 && notReverted.showTime === '2026-12-29 20:00',
   );
 
   const unparsable = row({

@@ -4,7 +4,13 @@ export type ParseStatus = 'parsed' | 'pending';
 
 export type EventStatus = 'scheduled' | 'cancelled' | 'pending_reparse' | 'pending';
 
-export type Layout = 'v2' | 'legacy';
+export type Layout = 'v2' | 'legacy' | 'stub';
+
+/**
+ * 摘要列表（stub）只提供演出编号、修订号与详情入口，正文需按当前会话单独拉取。
+ * 列表条目先以此标记入库（待补采），正文取回并核对编号/修订后才更新为 parsed。
+ */
+export const STUB_PENDING_PARSE_ERROR = '列表仅含编号与修订，正文待补采';
 
 export type AnnouncementInput = {
   annKey: string;
@@ -24,6 +30,8 @@ export type AnnouncementInput = {
   rawHtml: string;
   parseStatus: ParseStatus;
   parseError: string | null;
+  /** 摘要列表条目的详情入口（绑定当前会话的签名链接）；非摘要版式为空。 */
+  detailUrl?: string | null;
 };
 
 export interface ParsedPage {

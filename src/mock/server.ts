@@ -23,6 +23,8 @@ interface MockStats {
   rateLimited: number;
   aborted: number;
   sessionRotations: number;
+  detailRequests: number;
+  detailQuotaExhausted: number;
 }
 
 function escapeHtml(value: string): string {
@@ -101,16 +103,41 @@ function renderLegacyItem(item: MockItem): string {
 </div>`;
 }
 
+function renderStubEntry(item: MockItem, detailHref: string): string {
+  return `<article class="entry" data-event="${escapeHtml(item.eventId)}" data-revision="${item.revision}" data-site="${escapeHtml(item.siteId)}">
+  <span class="code">${escapeHtml(item.eventId)}</span> <span class="rev">修订 ${item.revision}</span>
+  <a class="detail-link" href="${escapeHtml(detailHref)}">详情</a>
+</article>`;
+}
+
 function renderPage(
   content: VenueContent,
   page: number,
   nextHref: string | null,
+  detailHref?: (siteId: string) => string,
 ): string {
   const total = pageCount(content);
   const items = itemsForPage(content, page);
   const venue = escapeHtml(content.venueId);
   const label = `${page} / ${total}`;
   const heading = `${venueLabel(content.venueId)} · 公告`;
+
+  if (content.layout === 'stub') {
+    const nav = nextHref
+      ? `<nav class="pager"><span class="page-label">第 ${label} 页</span><a rel="next" href="${escapeHtml(nextHref)}">下一页</a></nav>`
+      : `<nav class="pager"><span class="page-label">第 ${label} 页</span><span>没有更多公告</span></nav>`;
+    return `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>${heading}</title></head>
+<body data-layout="stub" data-venue="${venue}">
+<header><h1>${heading}</h1></header>
+<main class="announcement-index">
+${items.map((item) => renderStubEntry(item, detailHref ? detailHref(item.siteId) : '#')).join('\n')}
+</main>
+${nav}
+</body>
+</html>`;
+  }
 
   if (content.layout === 'v2') {
     const nav = nextHref
@@ -154,6 +181,20 @@ function renderRecoveryPage(venueId: string): string {
 </body></html>`;
 }
 
+/** 详情正文页：沿用新版式（v2）渲染单条公告。 */
+function renderDetailPage(content: VenueContent, item: MockItem): string {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>公告详情 ${escapeHtml(item.siteId)}</title></head>
+<body data-layout="v2" data-venue="${escapeHtml(content.venueId)}">
+<header><h1>${venueLabel(content.venueId)} · 公告详情</h1></header>
+<main class="announcement-list">
+${renderV2Item(item)}
+</main>
+</body>
+</html>`;
+}
+
 export interface MockSiteOptions {
   host?: string;
   port?: number;
@@ -164,7 +205,9 @@ export interface MockSiteOptions {
  * 本地模拟公告站：
  * - 三个剧场、两种版式、分页；
  * - 翻页签名绑定当前会话与翻页令牌，会话轮换后旧翻页链接返回 409；
- * - 支持临时限流（429 + Retry-After）与故障注入（中断连接）。
+ * - 支持临时限流（429 + Retry-After）与故障注入（中断连接）；
+ * - 摘要列表剧场（ring）：列表只给编号/修订/详情入口，详情链接同样绑定会话；
+ *   详情请求有每轮额度（403 告知用完），可注入“详情与列表不符”的正文。
  */
 export class MockSite {
   private readonly server: http.Server;
@@ -175,6 +218,8 @@ export class MockSite {
   private rotateAfter: number | null = null;
   private rateLimit: { seconds: number; remaining: number } | null = null;
   private abortAfter: number | null = null;
+  private detailQuota: number | null = null;
+  private detailMismatch = new Map<string, Partial<MockItem>>();
   private venueRequestCount = 0;
   private readonly stats: MockStats = {
     requests: 0,
@@ -183,6 +228,8 @@ export class MockSite {
     rateLimited: 0,
     aborted: 0,
     sessionRotations: 0,
+    detailRequests: 0,
+    detailQuotaExhausted: 0,
   };
   private listening: Promise<void> | null = null;
   private boundPort = 0;
@@ -267,7 +314,7 @@ export class MockSite {
     sid: string,
     state: SessionState,
     venueId: string,
-    page: number,
+    page: number | string,
   ): string {
     return createHmac('sha256', this.secret)
       .update(`${sid}:${state.token}:${venueId}:${page}:${state.epoch}`)
@@ -298,13 +345,14 @@ export class MockSite {
 
     const entry = url.pathname.match(/^\/venue\/([^/]+)\/?$/);
     const paged = url.pathname.match(/^\/venue\/([^/]+)\/page\/(\d+)$/);
-    if (!entry && !paged) {
+    const detail = url.pathname.match(/^\/venue\/([^/]+)\/detail\/([^/]+)$/);
+    if (!entry && !paged && !detail) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('not found');
       return;
     }
 
-    const venueId = decodeURIComponent((entry ?? paged)![1]);
+    const venueId = decodeURIComponent((entry ?? paged ?? detail)![1]);
     const content = venueContent(this.contentVersion, venueId);
     if (!content) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
@@ -336,6 +384,15 @@ export class MockSite {
       this.rotateSession();
     }
 
+    if (detail) {
+      this.handleDetail(req, res, detail, content, url);
+      return;
+    }
+
+    const detailHref = (sid: string, state: SessionState) => (siteId: string) =>
+      `/venue/${encodeURIComponent(venueId)}/detail/${encodeURIComponent(siteId)}` +
+      `?sig=${this.signature(sid, state, venueId, `detail:${siteId}`)}`;
+
     if (entry) {
       const { sid, state } = this.sessionFor(req, res);
       const nextHref =
@@ -344,7 +401,7 @@ export class MockSite {
           : null;
       this.stats.venuePagesServed += 1;
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(renderPage(content, 1, nextHref));
+      res.end(renderPage(content, 1, nextHref, detailHref(sid, state)));
       return;
     }
 
@@ -377,7 +434,73 @@ export class MockSite {
         : null;
     this.stats.venuePagesServed += 1;
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(renderPage(content, page, nextHref));
+    res.end(renderPage(content, page, nextHref, detailHref(sid!, state!)));
+  }
+
+  /**
+   * 详情正文：每轮有请求额度，额度用完返回 403；
+   * 签名绑定当前会话，会话轮换后旧详情链接返回 409。
+   */
+  private handleDetail(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    detail: RegExpMatchArray,
+    content: VenueContent,
+    url: URL,
+  ): void {
+    const venueId = content.venueId;
+    if (content.layout !== 'stub') {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('venue has no detail pages');
+      return;
+    }
+    const siteId = decodeURIComponent(detail[2]);
+
+    // 每轮详情额度：先用尽先拒绝，列表翻页不受额度影响。
+    if (this.detailQuota !== null && this.detailQuota <= 0) {
+      this.stats.detailQuotaExhausted += 1;
+      res.writeHead(403, {
+        'content-type': 'text/plain; charset=utf-8',
+        'x-detail-quota': 'exhausted',
+      });
+      res.end('本轮详情请求额度已用完，请下一轮再取');
+      return;
+    }
+
+    const sid = this.currentSid(req);
+    const state = sid ? this.sessions.get(sid) : undefined;
+    const expected =
+      sid && state ? this.signature(sid, state, venueId, `detail:${siteId}`) : null;
+    const provided = url.searchParams.get('sig') ?? '';
+    const valid =
+      Boolean(sid && state) &&
+      state!.epoch === this.epoch &&
+      expected !== null &&
+      expected === provided;
+    if (!valid) {
+      this.stats.pagingRecoveries += 1;
+      res.writeHead(409, {
+        'content-type': 'text/html; charset=utf-8',
+        'x-paging-recovery': 'entry',
+      });
+      res.end(renderRecoveryPage(venueId));
+      return;
+    }
+
+    const item = content.items.find((entry) => entry.siteId === siteId);
+    if (!item) {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('unknown announcement');
+      return;
+    }
+
+    if (this.detailQuota !== null) this.detailQuota -= 1;
+    this.stats.detailRequests += 1;
+    // 故障注入：详情正文与列表不符（编号/修订对不上），采集器应驳回。
+    const override = this.detailMismatch.get(siteId);
+    const rendered = override ? { ...item, ...override } : item;
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    res.end(renderDetailPage(content, rendered));
   }
 
   private async handleControl(
@@ -397,6 +520,8 @@ export class MockSite {
         this.rotateAfter = null;
         this.rateLimit = null;
         this.abortAfter = null;
+        this.detailQuota = null;
+        this.detailMismatch.clear();
         this.venueRequestCount = 0;
         this.stats.requests = 0;
         this.stats.venuePagesServed = 0;
@@ -404,6 +529,8 @@ export class MockSite {
         this.stats.rateLimited = 0;
         this.stats.aborted = 0;
         this.stats.sessionRotations = 0;
+        this.stats.detailRequests = 0;
+        this.stats.detailQuotaExhausted = 0;
         if (typeof payload.contentVersion === 'number') {
           this.contentVersion = payload.contentVersion;
         }
@@ -438,6 +565,35 @@ export class MockSite {
             : Number(payload.count);
         response = { ok: true, abortAfter: this.abortAfter };
         break;
+      case 'detail-quota':
+        // 每轮详情请求上限；null 表示不限。
+        this.detailQuota =
+          payload.count === null || payload.count === undefined
+            ? null
+            : Number(payload.count);
+        response = { ok: true, detailQuota: this.detailQuota };
+        break;
+      case 'detail-mismatch': {
+        // 让某条详情返回与列表不符的正文（编号/修订对不上）；clear 清除。
+        const siteId = String(payload.siteId ?? '');
+        if (payload.clear === true) {
+          this.detailMismatch.delete(siteId);
+        } else {
+          const override: Partial<MockItem> = {};
+          if (typeof payload.eventId === 'string') override.eventId = payload.eventId;
+          if (typeof payload.revision === 'number') override.revision = payload.revision;
+          if (typeof payload.title === 'string') override.title = payload.title;
+          if (typeof payload.showTime === 'string') override.showTime = payload.showTime;
+          if (typeof payload.doorsTime === 'string') override.doorsTime = payload.doorsTime;
+          this.detailMismatch.set(siteId, override);
+        }
+        response = {
+          ok: true,
+          siteId,
+          mismatch: this.detailMismatch.get(siteId) ?? null,
+        };
+        break;
+      }
       case 'stats':
         response = { ok: true, ...this.getInfo() };
         break;

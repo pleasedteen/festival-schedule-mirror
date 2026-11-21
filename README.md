@@ -36,7 +36,8 @@ npm test
 4. **改场前后**：只有一端公告时继续展示最近一次已确认排期并标记待确认；两端到齐后才切换剧场与时间；
 5. **重启与续采**：关闭并重新打开数据库后已确认排期仍可查询；采集中断后查询不受影响，随后续采成功；
 6. **一致性**：按演出编号与按剧场查询使用同一份已确认结果；
-7. 解析与折叠的边界检查（非法日期、占位文字、两端时间不一致、低修订号不覆盖等）。
+7. **摘要列表剧场**：列表只给编号/修订/详情入口时——详情额度用完仍翻完列表、下轮续采；会话轮换后重翻列表取得新详情链接；编号或修订不符的详情正文不入库；迟到的旧修订正文不把排期改回去；
+8. 解析与折叠的边界检查（非法日期、占位文字、两端时间不一致、低修订号不覆盖等）。
 
 另有快速单元检查：`npm run test:unit`。
 
@@ -46,6 +47,10 @@ npm test
 | --- | --- |
 | 公告解析可靠 | 写入 `announcements`，参与排期折叠 |
 | 无法可靠解析（缺时间、缺编号、时间非法等） | 标记为**待补采**，不影响其他公告；修正后重新采集即可进入排期 |
+| 摘要列表（只有编号/修订/详情入口） | 条目先入**待补采**存根；翻完列表后按修订号从大到小拉取详情正文 |
+| 详情额度 | 每轮额度用完（403）即停，剩余存根下轮续采；重启或公告换页后仍可补采 |
+| 详情正文核对 | 只有编号和修订都与列表匹配的正文才入库更新排期；错配正文驳回并保留已确认排期 |
+| 新旧修订分布在不同列表页 | 优先取最新修订；迟到的旧修订正文入库后也不把排期改回去 |
 | 同一演出跨剧场 | 沿用同一 `eventId`，按该演出的 `revision` 排序 |
 | 改场 | 原剧场端与新剧场端分别发布；仅收到一端时继续展示最近一次已确认排期并标记“改场待确认” |
 | 两端确认 | 方向一致且演出/入场时间一致，才对外切换剧场与时间 |
@@ -69,9 +74,9 @@ src/
   core/types.ts          领域类型
   core/time.ts           时间规范化、Retry-After 解析
   core/effective.ts      公告 → 唯一已确认排期的折叠规则
-  parse/parse.ts         新版/旧版 HTML 解析（cheerio）
+  parse/parse.ts         新版/旧版/摘要列表 HTML 解析（cheerio）
   parse/venues.ts        改场文本中的剧场识别
-  collect/collector.ts   翻页、会话恢复、限流等待、幂等入库
+  collect/collector.ts   翻页、会话恢复、限流等待、详情拉取（限额/错配核对）、幂等入库
   db/store.ts            DuckDB 存储与派生排期刷新
   query/desk.ts          查询服务（按编号 / 按剧场 / 待补采）
   query/view.ts          输出格式化
@@ -82,9 +87,11 @@ src/
 
 ## 模拟公告站
 
-- 入口：`/venue/grand`、`/venue/studio`、`/venue/harbor`；
-- 每页 2 条公告，共 2–4 页；`grand`/`harbor` 为新版式，`studio` 为旧版式；
+- 入口：`/venue/grand`、`/venue/studio`、`/venue/harbor`、`/venue/ring`；
+- 每页 2 条公告，共 2–4 页；`grand`/`harbor` 为新版式，`studio` 为旧版式，`ring` 为摘要列表版式；
 - 翻页链接形如 `/venue/grand/page/2?sig=...`，签名绑定会话 cookie 与翻页令牌；会话轮换后旧链接返回 `409`；
+- 摘要列表（`ring`）：列表条目只有编号、修订号与详情入口 `/venue/ring/detail/<公告ID>?sig=...`；
+  详情链接同样绑定会话，正文页按新版式渲染；每轮详情请求有额度上限，用完返回 `403`；
 - 内容版本（演示/测试用）：
 
 ```bash
@@ -98,7 +105,7 @@ curl -X POST http://127.0.0.1:8787/_control/content \
   | 2 | 海港剧场修正《暴风雨》入场时间；实验剧场补全《等待戈多》档期 |
   | 3 | 海港剧场补发 E-1005 改场公告，与实验剧场一端配对确认 |
 
-- 其他控制：`/_control/session/rotate`、`/_control/rotate-after`、`/_control/rate-limit`、`/_control/abort-after`、`/_control/stats`、`/_control/reset`。
+- 其他控制：`/_control/session/rotate`、`/_control/rotate-after`、`/_control/rate-limit`、`/_control/abort-after`、`/_control/detail-quota`、`/_control/detail-mismatch`、`/_control/stats`、`/_control/reset`。
 
 ## 查询输出示例
 

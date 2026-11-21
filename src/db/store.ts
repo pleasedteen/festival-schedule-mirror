@@ -2,11 +2,12 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DuckDBConnection, DuckDBInstance } from '@duckdb/node-api';
 import { computeEffective } from '../core/effective';
-import type {
-  AnnouncementInput,
-  AnnouncementRow,
-  ChangeConfirmation,
-  EventState,
+import {
+  STUB_PENDING_PARSE_ERROR,
+  type AnnouncementInput,
+  type AnnouncementRow,
+  type ChangeConfirmation,
+  type EventState,
 } from '../core/types';
 
 const COLUMNS = [
@@ -288,6 +289,18 @@ export class Store {
           continue;
         }
         if (signatureOf(current) === signatureOf(item)) {
+          unchanged += 1;
+          continue;
+        }
+        // 摘要列表重翻时条目仍是“正文待补采”，但正文可能已在上一轮取回：
+        // 编号与修订一致的已解析正文保留，不被列表摘要打回待补采。
+        if (
+          item.parseStatus === 'pending' &&
+          item.parseError === STUB_PENDING_PARSE_ERROR &&
+          current.parseStatus === 'parsed' &&
+          current.eventId === item.eventId &&
+          current.revision === item.revision
+        ) {
           unchanged += 1;
           continue;
         }

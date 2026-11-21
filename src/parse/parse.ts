@@ -2,11 +2,12 @@ import * as cheerio from 'cheerio';
 import type { CheerioAPI } from 'cheerio';
 import { venuesFromMoveText, venueIdByName } from './venues';
 import { assertDoorsBeforeShow, normalizeDateTime } from '../core/time';
-import type {
-  AnnouncementInput,
-  AnnouncementKind,
-  Layout,
-  ParsedPage,
+import {
+  STUB_PENDING_PARSE_ERROR,
+  type AnnouncementInput,
+  type AnnouncementKind,
+  type Layout,
+  type ParsedPage,
 } from '../core/types';
 
 export class AnnouncementParseError extends Error {}
@@ -225,10 +226,56 @@ function parseLegacy(
 
 function detectLayout($: CheerioAPI): Layout | null {
   const declared = $('body').attr('data-layout')?.trim();
-  if (declared === 'v2' || declared === 'legacy') return declared;
+  if (declared === 'v2' || declared === 'legacy' || declared === 'stub') {
+    return declared;
+  }
   if ($('main.announcement-list article.announcement').length > 0) return 'v2';
   if ($('#notices.old-layout .notice').length > 0) return 'legacy';
+  if ($('main.announcement-index article.entry').length > 0) return 'stub';
   return null;
+}
+
+/**
+ * 摘要列表条目：只有编号、修订号与详情入口。
+ * 正文不随列表下发，先入待补采，由采集器按详情链接单独拉取。
+ */
+function parseStub(
+  $: CheerioAPI,
+  el: cheerio.Cheerio<any>,
+  ctx: ParseContext,
+): AnnouncementInput {
+  const base = buildBase(el, $, ctx);
+  const href =
+    textOf(el.find('a.detail-link').first().attr('href')) ??
+    textOf(el.find('a[href*="/detail/"]').first().attr('href'));
+  let detailUrl: string | null = null;
+  if (href) {
+    try {
+      detailUrl = new URL(href, ctx.sourceUrl).toString();
+    } catch {
+      detailUrl = null;
+    }
+  }
+  return {
+    annKey: '',
+    venueId: ctx.venueId,
+    siteId: base.siteId,
+    kind: null,
+    eventId: base.eventId,
+    revision: base.revision,
+    title: null,
+    showTime: null,
+    doorsTime: null,
+    fromVenue: null,
+    toVenue: null,
+    sourceUrl: ctx.sourceUrl,
+    sourcePage: ctx.sourcePage,
+    layout: 'stub',
+    rawHtml: base.rawHtml,
+    parseStatus: 'pending',
+    parseError: detailUrl ? STUB_PENDING_PARSE_ERROR : '列表缺少详情入口',
+    detailUrl,
+  };
 }
 
 function nextUrlOf(
@@ -237,9 +284,9 @@ function nextUrlOf(
   layout: Layout,
 ): string | null {
   const link =
-    layout === 'v2'
-      ? $('nav.pager a[rel="next"]').first()
-      : $('#notices .pages a, .pages a').first();
+    layout === 'legacy'
+      ? $('#notices .pages a, .pages a').first()
+      : $('nav.pager a[rel="next"]').first();
   const href = textOf(link.attr('href'));
   if (!href) return null;
   try {
@@ -268,7 +315,11 @@ export function parsePage(
 
   const announcements: AnnouncementInput[] = [];
   const elements =
-    layout === 'v2' ? $('article.announcement').toArray() : $('#notices .notice').toArray();
+    layout === 'v2'
+      ? $('article.announcement').toArray()
+      : layout === 'legacy'
+        ? $('#notices .notice').toArray()
+        : $('main.announcement-index article.entry').toArray();
 
   elements.forEach((element, index) => {
     const el = $(element);
@@ -284,7 +335,9 @@ export function parsePage(
       parsed =
         layout === 'v2'
           ? parseV2($, el, ctx)
-          : parseLegacy($, el, ctx);
+          : layout === 'legacy'
+            ? parseLegacy($, el, ctx)
+            : parseStub($, el, ctx);
     } catch (error) {
       parsed = {
         annKey: '',

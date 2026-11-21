@@ -3,6 +3,7 @@ export const VENUES: Record<string, string> = {
   grand: '大剧院',
   studio: '实验剧场',
   harbor: '海港剧场',
+  ring: '环形剧场',
 };
 
 export const VENUE_IDS = Object.keys(VENUES);

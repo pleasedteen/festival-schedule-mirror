@@ -105,6 +105,11 @@ async function cmdCollect(args: Args): Promise<number> {
           ` 版式 ${venue.layout ?? '-'} 页数 ${venue.pages}` +
           ` 公告 ${venue.announcements} 条 待补采 ${venue.pending}` +
           ` 翻页恢复 ${venue.recoveries} 次 限流等待 ${venue.rateLimitWaits} 次` +
+          (venue.detailsFetched || venue.detailsPending
+            ? ` 详情已取 ${venue.detailsFetched} / 待补 ${venue.detailsPending}`
+            : '') +
+          (venue.quotaExhausted ? ' 详情额度已用完' : '') +
+          (venue.detailMismatches ? ` 详情错配 ${venue.detailMismatches} 条` : '') +
           (venue.error ? ` 错误：${venue.error}` : ''),
       );
     }
