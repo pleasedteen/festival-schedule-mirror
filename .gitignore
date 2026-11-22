@@ -3,3 +3,5 @@ dist/
 data/
 *.duckdb
 *.duckdb.wal
+*.progress.json
+*.progress.json.tmp

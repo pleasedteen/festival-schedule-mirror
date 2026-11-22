@@ -175,6 +175,8 @@ export class MockSite {
   private rotateAfter: number | null = null;
   private rateLimit: { seconds: number; remaining: number } | null = null;
   private abortAfter: number | null = null;
+  /** 每个剧场页面请求前的固定延迟（毫秒），供测试稳定捕捉采集运行态。 */
+  private delayMs = 0;
   private venueRequestCount = 0;
   private readonly stats: MockStats = {
     requests: 0,
@@ -312,6 +314,10 @@ export class MockSite {
       return;
     }
 
+    if (this.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    }
+
     // 临时限流：按站点给出的 Retry-After 恢复访问。
     if (this.rateLimit && this.rateLimit.remaining > 0) {
       this.rateLimit.remaining -= 1;
@@ -397,6 +403,7 @@ export class MockSite {
         this.rotateAfter = null;
         this.rateLimit = null;
         this.abortAfter = null;
+        this.delayMs = 0;
         this.venueRequestCount = 0;
         this.stats.requests = 0;
         this.stats.venuePagesServed = 0;
@@ -437,6 +444,10 @@ export class MockSite {
             ? null
             : Number(payload.count);
         response = { ok: true, abortAfter: this.abortAfter };
+        break;
+      case 'delay':
+        this.delayMs = Math.max(0, Number(payload.ms ?? 0));
+        response = { ok: true, delayMs: this.delayMs };
         break;
       case 'stats':
         response = { ok: true, ...this.getInfo() };

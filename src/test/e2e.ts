@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { MockSite } from '../mock/server';
 import { Store } from '../db/store';
 import { Collector } from '../collect/collector';
@@ -8,9 +9,13 @@ import { FestivalDesk } from '../query/desk';
 import { formatConfirmation, formatEventLine } from '../query/view';
 import { runUnitChecks } from './unit';
 import { venueName } from '../venues';
+import { ProgressReader } from '../progress/reader';
+import { formatProgress } from '../progress/view';
+import type { ProgressDiagnosis } from '../progress/reader';
 import type { EventState } from '../core/types';
 
 const TOTAL_BUDGET_MS = 80_000;
+const CLI_PATH = join(__dirname, '..', 'cli.js');
 
 interface CheckResult {
   passed: number;
@@ -78,6 +83,51 @@ async function collect(
   return collector.collectAll(venues);
 }
 
+interface CliResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** 以独立进程运行真实 CLI，模拟操作员另开终端执行命令。 */
+function runCli(args: string[]): {
+  child: ReturnType<typeof spawn>;
+  done: Promise<CliResult>;
+} {
+  const child = spawn(process.execPath, [CLI_PATH, ...args], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => {
+    stdout += String(chunk);
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += String(chunk);
+  });
+  const done = new Promise<CliResult>((resolve) => {
+    child.on('exit', (code) => resolve({ code: code ?? -1, stdout, stderr }));
+  });
+  return { child, done };
+}
+
+function progressQuery(dbPath: string, progressPath: string): ProgressDiagnosis {
+  return ProgressReader.read(progressPath);
+}
+
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs: number,
+  intervalMs = 25,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return predicate();
+}
+
 export async function runE2E(): Promise<number> {
   const started = Date.now();
   const harness = new Harness();
@@ -85,10 +135,12 @@ export async function runE2E(): Promise<number> {
   await site.listen(0);
   const workdir = mkdtempSync(join(tmpdir(), 'festival-desk-e2e-'));
   const dbPath = join(workdir, 'festival.duckdb');
+  const diagDir = mkdtempSync(join(tmpdir(), 'festival-desk-diag-'));
 
   console.log('戏剧节服务台 · 本地端到端验证');
   console.log(`模拟公告站 ${site.baseUrl}`);
   console.log(`临时数据库 ${dbPath}`);
+  const children = new Set<ReturnType<typeof spawn>>();
 
   try {
     /* ---------- 1. 翻页恢复 ---------- */
@@ -267,6 +319,323 @@ export async function runE2E(): Promise<number> {
       harness.check(name, condition, detail),
     );
 
+    /* ---------- 9. 限流等待期间的独立 CLI 诊断 ---------- */
+    harness.section('9. 独立诊断查询：限流等待时返回最后已提交页与预计恢复时间');
+    const diagDb = join(diagDir, 'diag.duckdb');
+    const diagProgress = join(diagDir, 'diag.progress.json');
+    const spawnCli = (args: string[]) => {
+      const handle = runCli(args);
+      children.add(handle.child);
+      handle.child.on('exit', () => children.delete(handle.child));
+      return handle;
+    };
+    const collectArgs = (extra: string[] = []) => [
+      'collect',
+      '--site',
+      site.baseUrl,
+      '--db',
+      diagDb,
+      '--progress',
+      diagProgress,
+      ...extra,
+    ];
+    const progressArgs = ['progress', '--db', diagDb, '--progress', diagProgress];
+
+    // 没有任何采集记录时，诊断查询明确报错而不是编造进度。
+    const noProgress = spawnCli(progressArgs);
+    const noProgressResult = await noProgress.done;
+    harness.equal('无进度文件时诊断查询返回非零退出码', noProgressResult.code, 1);
+
+    await control(site, 'reset', { contentVersion: 1 });
+    await control(site, 'delay', { ms: 250 });
+    const waiting = spawnCli(collectArgs(['--venue', 'grand']));
+    try {
+      // 先等第 1 页越过提交边界，再注入一次限流：第 2 页一上来就遇到 429（等待 1 秒）。
+      const gotFirstPage = await waitFor(() => {
+        try {
+          const d = progressQuery(diagDb, diagProgress);
+          const g = d.venues.find((item) => item.venue.venueId === 'grand');
+          return (g?.venue.committedPages ?? []).includes(1);
+        } catch {
+          return false;
+        }
+      }, 4000);
+      harness.check('第 1 页已先提交', gotFirstPage);
+      await control(site, 'rate-limit', { seconds: 1, remaining: 1 });
+      // 等待期间：诊断查询在另一个进程里即时返回。
+      const gotWaiting = await waitFor(() => {
+        try {
+          const d = progressQuery(diagDb, diagProgress);
+          const grand2 = d.venues.find((item) => item.venue.venueId === 'grand');
+          return (
+            grand2?.lastAttempt?.attempt.phase === 'rate_limited' &&
+            grand2.lastAttempt.attempt.page === 2
+          );
+        } catch {
+          return false;
+        }
+      }, 4000);
+      harness.check('另一个 CLI 进程能查到正在限流等待', gotWaiting);
+      const waitingDiag = progressQuery(diagDb, diagProgress);
+      harness.equal('诊断侧确认采集进程仍在运行', waitingDiag.processState, 'running');
+      const waitingVenue = waitingDiag.venues.find(
+        (item) => item.venue.venueId === 'grand',
+      )!;
+      harness.equal(
+        '等待恢复前最后已提交页是第 1 页',
+        waitingVenue.venue.committedPages.at(-1),
+        1,
+      );
+      harness.check(
+        '等待中的第 2 页未越过提交边界',
+        !waitingVenue.venue.committedPages.includes(2) &&
+          waitingVenue.venue.lastAttempt?.phase === 'rate_limited',
+      );
+      if (gotWaiting) {
+        const rl = waitingVenue.lastAttempt!.attempt.rateLimit!;
+        harness.equal('记录的是本次实际等待时长（Retry-After）', rl.retryAfterMs, 1000);
+        const remaining = waitingVenue.lastAttempt!.remainingWaitMs!;
+        harness.check(
+          '给出预计恢复时间与剩余等待',
+          Date.parse(rl.resumeAt) > Date.now() && remaining > 0 && remaining <= 1000,
+          `剩余 ${remaining}ms`,
+        );
+        console.log('  —— 独立诊断输出（等待期间）——');
+        for (const line of formatProgress(waitingDiag).split('\n')) console.log(`     ${line}`);
+        const jsonProbe = spawnCli([...progressArgs, '--json']);
+        const jsonResult = await jsonProbe.done;
+        harness.equal('诊断查询支持 --json 结构化输出', jsonResult.code, 0);
+        const parsedJson = JSON.parse(jsonResult.stdout);
+        harness.equal(
+          'JSON 中保留预计恢复时刻',
+          parsedJson.venues[0].lastAttempt.attempt.rateLimit.resumeAt,
+          rl.resumeAt,
+        );
+      }
+    } finally {
+      const waitedResult = await waiting.done;
+      harness.equal('限流等待结束后采集正常完成', waitedResult.code, 0);
+    }
+    const doneDiag = progressQuery(diagDb, diagProgress);
+    const doneVenue = doneDiag.venues.find((item) => item.venue.venueId === 'grand')!;
+    harness.equal(
+      '完成后两页均已提交、在库 4 条公告',
+      doneVenue.venue.committedAnnouncements,
+      4,
+    );
+    harness.equal('完成后进程状态为正常结束', doneDiag.processState, 'exited');
+    harness.equal('限流等待计数为 1', doneVenue.venue.rateLimitWaits, 1);
+
+    /* ---------- 10. 会话轮换重读不虚增进度 ---------- */
+    harness.section('10. 独立诊断查询：会话轮换重读旧页单独显示，不虚增已入库进度');
+    await control(site, 'reset', { contentVersion: 1 });
+    await control(site, 'delay', { ms: 250 });
+    // 第 2 个剧场页面请求（即 grand 第 2 页）时轮换会话，旧签名 409，随后回到入口重读第 1 页。
+    await control(site, 'rotate-after', { count: 2 });
+    const rotating = spawnCli(collectArgs(['--venue', 'grand']));
+    // 记录轮换前第 1 页已提交的在库基数，用于证明重读不会虚增。
+    let baselineAnnouncements: number | null = null;
+    try {
+      const gotFirstCommit = await waitFor(() => {
+        try {
+          const d = progressQuery(diagDb, diagProgress);
+          const g = d.venues.find((item) => item.venue.venueId === 'grand');
+          return (g?.venue.committedPages ?? []).includes(1);
+        } catch {
+          return false;
+        }
+      }, 4000);
+      harness.check('轮换前第 1 页已先提交', gotFirstCommit);
+      baselineAnnouncements =
+        progressQuery(diagDb, diagProgress).venues.find(
+          (item) => item.venue.venueId === 'grand',
+        )?.venue.committedAnnouncements ?? null;
+      const gotReread = await waitFor(() => {
+        try {
+          const d = progressQuery(diagDb, diagProgress);
+          const g = d.venues.find((item) => item.venue.venueId === 'grand');
+          return (g?.venue.reReads ?? 0) > 0;
+        } catch {
+          return false;
+        }
+      }, 4000);
+      harness.check('诊断查询抓到会话轮换后的重读', gotReread);
+      const rereadDiag = progressQuery(diagDb, diagProgress);
+      const rereadVenue = rereadDiag.venues.find(
+        (item) => item.venue.venueId === 'grand',
+      )!;
+      harness.check(
+        '重读被单独标记（reread）且与新页区分',
+        rereadVenue.venue.lastAttempt?.reread === true,
+      );
+      harness.check(
+        '重读期间已提交页不回退也不虚增',
+        rereadVenue.venue.committedPages.length === 1 &&
+          rereadVenue.venue.committedPages[0] === 1 &&
+          rereadVenue.venue.committedAnnouncements === baselineAnnouncements,
+        `已提交页 ${JSON.stringify(rereadVenue.venue.committedPages)}，在库 ${rereadVenue.venue.committedAnnouncements} 条（重读前 ${baselineAnnouncements} 条）`,
+      );
+      console.log('  —— 独立诊断输出（重读期间）——');
+      for (const line of formatProgress(rereadDiag).split('\n')) console.log(`     ${line}`);
+    } finally {
+      const rotatedResult = await rotating.done;
+      harness.equal('会话轮换后采集仍成功完成', rotatedResult.code, 0);
+    }
+    const afterReread = progressQuery(diagDb, diagProgress).venues.find(
+      (item) => item.venue.venueId === 'grand',
+    )!;
+    harness.check(
+      '恢复后翻页恢复与重读都被计数',
+      afterReread.venue.recoveries >= 1 && afterReread.venue.reReads >= 1,
+      `恢复 ${afterReread.venue.recoveries} 次，重读 ${afterReread.venue.reReads} 次`,
+    );
+    harness.equal(
+      '重读不产生重复入库：仍为 2 页 4 条',
+      afterReread.venue.committedAnnouncements,
+      4,
+    );
+    harness.equal(
+      '已提交页号去重后仍是 1、2',
+      JSON.stringify(afterReread.venue.committedPages),
+      '[1,2]',
+    );
+
+    /* ---------- 11. 强制结束后的提交边界诊断 ---------- */
+    harness.section('11. 采集进程被强制结束：按提交边界区分已提交页与最后尝试落点');
+    await control(site, 'reset', { contentVersion: 1 });
+    await control(site, 'delay', { ms: 200 });
+    await control(site, 'rate-limit', { seconds: 1, remaining: 1 });
+    const killedBeforeCommit = spawnCli(collectArgs(['--venue', 'harbor']));
+    try {
+      const gotWait = await waitFor(() => {
+        try {
+          const d = progressQuery(diagDb, diagProgress);
+          const h = d.venues.find((item) => item.venue.venueId === 'harbor');
+          return h?.lastAttempt?.attempt.phase === 'rate_limited';
+        } catch {
+          return false;
+        }
+      }, 4000);
+      harness.check('海港剧场第 1 页进入限流等待', gotWait);
+      killedBeforeCommit.child.kill('SIGKILL');
+    } finally {
+      await killedBeforeCommit.done;
+    }
+    await waitFor(
+      () => progressQuery(diagDb, diagProgress).processState === 'killed',
+      2000,
+    );
+    const killedDiag = progressQuery(diagDb, diagProgress);
+    harness.equal('诊断侧识别进程已被强制结束', killedDiag.processState, 'killed');
+    const killedVenue = killedDiag.venues.find(
+      (item) => item.venue.venueId === 'harbor',
+    )!;
+    harness.equal(
+      '被杀前没有任何页越过提交边界',
+      killedVenue.venue.committedPages.length,
+      0,
+    );
+    harness.equal(
+      '最后一次尝试停在限流等待的第 1 页',
+      `${killedVenue.venue.lastAttempt?.page}:${killedVenue.venue.lastAttempt?.phase}`,
+      '1:rate_limited',
+    );
+    console.log('  —— 独立诊断输出（提交前被杀）——');
+    for (const line of formatProgress(killedDiag).split('\n')) console.log(`     ${line}`);
+
+    // 页面已提交之后再杀：已提交页保留，最后尝试停在尚未提交的第 2 页。
+    await control(site, 'reset', { contentVersion: 1 });
+    await control(site, 'delay', { ms: 300 });
+    const killedAfterCommit = spawnCli(collectArgs(['--venue', 'harbor']));
+    try {
+      // 同时满足：第 1 页已提交，且第 2 页尝试已经开始（此时它还在请求中，尚未提交）。
+      const gotSecondAttempt = await waitFor(() => {
+        try {
+          const d = progressQuery(diagDb, diagProgress);
+          const h = d.venues.find((item) => item.venue.venueId === 'harbor');
+          return (
+            (h?.venue.committedPages ?? []).includes(1) &&
+            h?.venue.lastAttempt?.page === 2 &&
+            h.venue.lastAttempt.phase !== 'done'
+          );
+        } catch {
+          return false;
+        }
+      }, 4000);
+      harness.check('第 1 页已提交、第 2 页尝试已开始后再强制结束进程', gotSecondAttempt);
+      killedAfterCommit.child.kill('SIGKILL');
+    } finally {
+      await killedAfterCommit.done;
+    }
+    await waitFor(
+      () => progressQuery(diagDb, diagProgress).processState === 'killed',
+      2000,
+    );
+    const afterKillDiag = progressQuery(diagDb, diagProgress);
+    const afterKillVenue = afterKillDiag.venues.find(
+      (item) => item.venue.venueId === 'harbor',
+    )!;
+    harness.equal(
+      '已提交的第 1 页保留在提交边界内',
+      JSON.stringify(afterKillVenue.venue.committedPages),
+      '[1]',
+    );
+    harness.equal(
+      '最后一次尝试停在未提交的第 2 页',
+      afterKillVenue.venue.lastAttempt?.page,
+      2,
+    );
+    harness.check(
+      '第 2 页阶段不是已完成（未提交）',
+      afterKillVenue.venue.lastAttempt?.phase !== 'done',
+      afterKillVenue.venue.lastAttempt?.phase,
+    );
+    harness.equal(
+      '在库公告数停留在第 1 页的 2 条',
+      afterKillVenue.venue.committedAnnouncements,
+      2,
+    );
+    console.log('  —— 独立诊断输出（提交后被杀）——');
+    for (const line of formatProgress(afterKillDiag).split('\n')) console.log(`     ${line}`);
+
+    // 已确认排期仍可通过原有编号 / 剧场查询访问（重新打开独立诊断库验证）。
+    await control(site, 'reset', { contentVersion: 1 });
+    {
+      const diagStore = await Store.open(diagDb);
+      try {
+        const diagDesk = new FestivalDesk(diagStore);
+        const e1007 = await diagDesk.findEvent('E-1007');
+        harness.check(
+          '中断库仍可按编号查询已确认排期',
+          e1007?.status === 'scheduled' && e1007.venueId === 'harbor',
+          describe(e1007),
+        );
+        const harborSchedule = await diagDesk.venueSchedule('harbor');
+        harness.check(
+          '中断库仍可按剧场查询同一份结果',
+          harborSchedule.some((event) => event.eventId === 'E-1007'),
+          harborSchedule.map((event) => event.eventId).join(', '),
+        );
+      } finally {
+        await diagStore.close();
+      }
+    }
+
+    // 续采：清除故障后重新采集，进度文件走到正常结束。
+    const resumedCli = spawnCli(collectArgs(['--venue', 'harbor']));
+    const resumedCliResult = await resumedCli.done;
+    harness.equal('强制结束后续采成功', resumedCliResult.code, 0);
+    const resumedDiag = progressQuery(diagDb, diagProgress);
+    harness.equal('续采后进度文件标记为正常结束', resumedDiag.processState, 'exited');
+    harness.equal(
+      '续采后海港两页全部提交',
+      JSON.stringify(
+        resumedDiag.venues.find((item) => item.venue.venueId === 'harbor')!.venue
+          .committedPages,
+      ),
+      '[1,2]',
+    );
+
     const elapsed = Date.now() - started;
     const ok = harness.checks.failed === 0 && elapsed <= TOTAL_BUDGET_MS;
     console.log(
@@ -277,11 +646,19 @@ export async function runE2E(): Promise<number> {
     await store.close();
     return ok ? 0 : 1;
   } finally {
+    for (const child of children) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* 已退出 */
+      }
+    }
     try {
       await site.close();
     } catch {
       /* 已关闭 */
     }
     rmSync(workdir, { recursive: true, force: true });
+    rmSync(diagDir, { recursive: true, force: true });
   }
 }

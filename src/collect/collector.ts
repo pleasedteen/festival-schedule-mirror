@@ -3,6 +3,7 @@ import { parsePage } from '../parse/parse';
 import { formatDuration, parseRetryAfter, sleep } from '../core/time';
 import type { Store } from '../db/store';
 import type { AnnouncementInput } from '../core/types';
+import type { ProgressTracker } from '../progress/tracker';
 
 export interface CollectorOptions {
   baseUrl: string;
@@ -12,6 +13,8 @@ export interface CollectorOptions {
   /** 注入日志，测试里可静默。 */
   log?: (message: string) => void;
   sleepFn?: (ms: number) => Promise<void>;
+  /** 可选的运行态记录器，供独立 CLI 诊断查询读取。 */
+  progress?: ProgressTracker;
 }
 
 export interface VenueCollectResult {
@@ -77,6 +80,12 @@ interface FetchOutcome {
   error: string | null;
 }
 
+interface PageContext {
+  venueId: string;
+  page: number;
+  reread: boolean;
+}
+
 /**
  * 单剧场采集：从入口页开始翻页；遇到 429 按 Retry-After 等待；
  * 遇到翻页签名失效（409）则重新取得入口页并回到可用的翻页位置。
@@ -88,6 +97,7 @@ export class Collector {
   private readonly maxRateLimitWaitMs: number;
   private readonly log: (message: string) => void;
   private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly progress: ProgressTracker | null;
 
   constructor(options: CollectorOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, '');
@@ -96,13 +106,16 @@ export class Collector {
     this.maxRateLimitWaitMs = options.maxRateLimitWaitMs ?? 15_000;
     this.log = options.log ?? (() => undefined);
     this.sleepFn = options.sleepFn ?? sleep;
+    this.progress = options.progress ?? null;
   }
 
   private async fetchPage(
     url: string,
     jar: CookieJar,
+    ctx: PageContext,
   ): Promise<FetchOutcome> {
     let retriedAfterMs: number | null = null;
+    let waitNumber = 0;
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const headers: Record<string, string> = {
         accept: 'text/html,application/xhtml+xml',
@@ -141,8 +154,17 @@ export class Collector {
             error: `限流等待 ${formatDuration(delay)} 超过上限`,
           };
         }
+        waitNumber += 1;
         retriedAfterMs = (retriedAfterMs ?? 0) + delay;
         this.log(`  限流：${url} 返回 429，按 Retry-After 等待 ${formatDuration(delay)}`);
+        this.progress?.rateLimitWait(ctx.venueId, {
+          page: ctx.page,
+          url,
+          reread: ctx.reread,
+          retryAfterMs: delay,
+          cumulativeMs: retriedAfterMs,
+          waitNumber,
+        });
         await this.sleepFn(delay);
         continue;
       }
@@ -184,6 +206,7 @@ export class Collector {
   }
 
   async collectVenue(venueId: string): Promise<VenueCollectResult> {
+    this.progress?.venueStarted(venueId);
     const jar = createCookieJar();
     const entryUrl = `${this.baseUrl}/venue/${encodeURIComponent(venueId)}`;
     let pages = 0;
@@ -193,19 +216,28 @@ export class Collector {
     let changed = 0;
     let pending = 0;
     let layout: string | null = null;
+    // 本次运行已经成功提交过的页号：会话轮换重读这些页时单独标记，不重复计进度。
+    const seenPages = new Set<number>();
 
     let nextUrl: string | null = entryUrl;
     let pageNo = 1;
     let failures = 0;
 
     while (nextUrl && pages < this.maxPages) {
-      const outcome = await this.fetchPage(nextUrl, jar);
+      const reread = seenPages.has(pageNo);
+      this.progress?.pageAttempt(venueId, pageNo, nextUrl, reread);
+      const outcome = await this.fetchPage(nextUrl, jar, {
+        venueId,
+        page: pageNo,
+        reread,
+      });
       if (outcome.retriedAfterMs !== null) rateLimitWaits += 1;
 
       if (outcome.recovery) {
         // 翻页签名失效：丢弃旧链接、回到入口页重新取得可用的翻页位置。
         recoveries += 1;
         failures += 1;
+        this.progress?.recovery(venueId, null);
         if (failures > 4) {
           return this.failure(venueId, pages, layout, recoveries, rateLimitWaits, '翻页位置多次失效');
         }
@@ -216,29 +248,34 @@ export class Collector {
       }
 
       if (!outcome.ok) {
+        const message = outcome.rateLimited
+          ? `限流等待超过上限（${outcome.status}）`
+          : (outcome.error ?? `请求失败：HTTP ${outcome.status}`);
+        this.progress?.pageFailed(venueId, pageNo, message);
         return this.failure(
           venueId,
           pages,
           layout,
           recoveries,
           rateLimitWaits,
-          outcome.rateLimited
-            ? `限流等待超过上限（${outcome.status}）`
-            : (outcome.error ?? `请求失败：HTTP ${outcome.status}`),
+          message,
         );
       }
 
       let parsed;
       try {
+        this.progress?.pagePhase(venueId, pageNo, 'parsing');
         parsed = parsePage(outcome.html, outcome.url, pageNo, venueId);
       } catch (error) {
+        const message = (error as Error).message;
+        this.progress?.pageFailed(venueId, pageNo, message);
         return this.failure(
           venueId,
           pages,
           layout,
           recoveries,
           rateLimitWaits,
-          (error as Error).message,
+          message,
         );
       }
 
@@ -246,18 +283,34 @@ export class Collector {
       const items: AnnouncementInput[] = parsed.announcements.map((item) => ({
         ...item,
       }));
+      this.progress?.pagePhase(venueId, pageNo, 'committing');
       const outcomeWrite = await this.store.upsertPage(items, new Date().toISOString());
       inserted += outcomeWrite.inserted;
       changed += outcomeWrite.changed;
       pending += items.filter((item) => item.parseStatus === 'pending').length;
       pages += 1;
+      seenPages.add(pageNo);
       failures = 0;
+
+      // 提交边界：upsertPage 事务成功后才推进，并按数据库实况统计在库公告，
+      // 这样会话轮换后的重读不会虚增已入库进度。
+      const allRows = await this.store.allAnnouncements();
+      const venueCount = allRows.filter((item) => item.venueId === venueId).length;
+      this.progress?.pageCommitted(venueId, {
+        page: pageNo,
+        url: outcome.url,
+        reread,
+        inserted: outcomeWrite.inserted,
+        changed: outcomeWrite.changed,
+        totalVenueAnnouncements: venueCount,
+      });
 
       this.log(
         `  ${venueId} 第 ${pageNo} 页（${parsed.layout}）：${items.length} 条` +
           (outcomeWrite.inserted || outcomeWrite.changed
             ? `，新增 ${outcomeWrite.inserted} / 更新 ${outcomeWrite.changed}`
-            : '，无变化'),
+            : '，无变化') +
+          (reread ? '（会话轮换重读，不重复计进度）' : ''),
       );
 
       if (parsed.nextUrl) {
@@ -284,6 +337,7 @@ export class Collector {
       lastError: null,
       announcements: venueItems.length,
     });
+    this.progress?.venueFinished(venueId, 'ok', null);
 
     return {
       venueId,
@@ -319,6 +373,7 @@ export class Collector {
       lastError: error,
       announcements: 0,
     });
+    this.progress?.venueFinished(venueId, 'failed', error);
     return {
       venueId,
       pages,
@@ -336,25 +391,41 @@ export class Collector {
 
   /** 依次采集各剧场；单剧场失败不影响其他剧场。 */
   async collectAll(venueIds: string[] = VENUE_IDS): Promise<CollectResult> {
+    this.progress?.setPhase('collecting');
     const venues: VenueCollectResult[] = [];
-    for (const venueId of venueIds) {
-      this.log(`采集 ${venueId}`);
-      try {
-        venues.push(await this.collectVenue(venueId));
-      } catch (error) {
-        venues.push(
-          await this.failure(venueId, 0, null, 0, 0, (error as Error).message),
-        );
+    let runFailed = false;
+    try {
+      for (const venueId of venueIds) {
+        this.log(`采集 ${venueId}`);
+        try {
+          venues.push(await this.collectVenue(venueId));
+        } catch (error) {
+          runFailed = true;
+          const message = (error as Error).message;
+          this.progress?.venueFinished(venueId, 'failed', message);
+          venues.push(
+            await this.failure(venueId, 0, null, 0, 0, message),
+          );
+        }
       }
+      // 每轮采集（含单剧场）后统一刷新派生排期；中断时这里仍会执行，
+      // 保证已入库的公告与已确认的改场立即可查。
+      this.progress?.setPhase('refreshing');
+      await this.store.refreshEffective();
+      const rows = await this.store.allAnnouncements();
+      this.progress?.setPhase(runFailed ? 'failed' : 'finished');
+      this.progress?.setError(runFailed ? '部分剧场采集失败' : null);
+      return {
+        venues,
+        announcements: rows.length,
+        pending: rows.filter((row) => row.parseStatus === 'pending').length,
+      };
+    } catch (error) {
+      this.progress?.setPhase('failed');
+      this.progress?.setError((error as Error).message);
+      throw error;
+    } finally {
+      await this.progress?.flush();
     }
-    // 每轮采集（含单剧场）后统一刷新派生排期；中断时这里仍会执行，
-    // 保证已入库的公告与已确认的改场立即可查。
-    await this.store.refreshEffective();
-    const rows = await this.store.allAnnouncements();
-    return {
-      venues,
-      announcements: rows.length,
-      pending: rows.filter((row) => row.parseStatus === 'pending').length,
-    };
   }
 }

@@ -1,10 +1,14 @@
 #!/usr/bin/env node
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Store } from './db/store';
 import { FestivalDesk } from './query/desk';
 import { Collector } from './collect/collector';
 import { formatConfirmation, formatEventLine, statusLabel } from './query/view';
 import { VENUES, VENUE_IDS, venueName } from './venues';
+import { ProgressTracker, defaultProgressPath } from './progress/tracker';
+import { ProgressReader } from './progress/reader';
+import { formatProgress } from './progress/view';
 import type { EventState } from './core/types';
 
 const DEFAULT_DB = resolve(process.cwd(), 'data/festival.duckdb');
@@ -17,8 +21,8 @@ function usage(): void {
   node dist/cli.js mock [--port 8787] [--content 1]
       启动本地模拟公告站（前台运行，Ctrl+C 结束）
 
-  node dist/cli.js collect [--site URL] [--db PATH] [--venue ID ...]
-      采集各剧场公告并写入 DuckDB
+  node dist/cli.js collect [--site URL] [--db PATH] [--venue ID ...] [--progress PATH]
+      采集各剧场公告并写入 DuckDB（采集态实时写入进度文件）
 
   node dist/cli.js query event <演出编号> [--db PATH]
   node dist/cli.js query venue <剧场代码> [--db PATH]
@@ -26,7 +30,11 @@ function usage(): void {
   node dist/cli.js query pending [--db PATH]
       查询已确认排期（不联网）
 
-  node dist/cli.js repair [--db PATH] [--site URL]
+  node dist/cli.js progress [--db PATH] [--progress PATH] [--json]
+      独立诊断查询：最后已提交页、限流预计恢复时间、会话轮换重读、
+      以及采集进程被强制结束后停在哪个提交边界（只读进度文件，不打开数据库）
+
+  node dist/cli.js repair [--db PATH] [--site URL] [--progress PATH]
       对“待补采”公告所在剧场重新采集
 
   node dist/cli.js test
@@ -69,6 +77,10 @@ function dbPath(args: Args): string {
   return resolve(single(args, 'db') ?? DEFAULT_DB);
 }
 
+function progressPathFor(args: Args): string {
+  return resolve(single(args, 'progress') ?? defaultProgressPath(dbPath(args)));
+}
+
 async function withStore<T>(path: string, fn: (store: Store) => Promise<T>): Promise<T> {
   const store = await Store.open(path);
   try {
@@ -90,11 +102,15 @@ async function cmdCollect(args: Args): Promise<number> {
 
   console.log(`采集站点 ${site}`);
   console.log(`数据库   ${path}`);
+  const progressFile = progressPathFor(args);
+  console.log(`进度文件 ${progressFile}（可用 progress 子命令独立查询）`);
+  const tracker = new ProgressTracker(progressFile, path);
   return withStore(path, async (store) => {
     const collector = new Collector({
       baseUrl: site,
       store,
       log: (message) => console.log(message),
+      progress: tracker,
     });
     const result = await collector.collectAll(venues);
     console.log('');
@@ -218,6 +234,7 @@ async function cmdQuery(args: Args): Promise<number> {
 async function cmdRepair(args: Args): Promise<number> {
   const path = dbPath(args);
   const site = single(args, 'site') ?? DEFAULT_SITE;
+  const tracker = new ProgressTracker(progressPathFor(args), path);
   return withStore(path, async (store) => {
     const desk = new FestivalDesk(store);
     const pending = await desk.pendingReparse();
@@ -231,6 +248,7 @@ async function cmdRepair(args: Args): Promise<number> {
       baseUrl: site,
       store,
       log: (message) => console.log(message),
+      progress: tracker,
     });
     const result = await collector.collectAll(venues);
     const remaining = await desk.pendingReparse();
@@ -240,6 +258,22 @@ async function cmdRepair(args: Args): Promise<number> {
     console.log(`剩余待补采 ${remaining.length} 条`);
     return remaining.length === 0 ? 0 : 1;
   });
+}
+
+async function cmdProgress(args: Args): Promise<number> {
+  const file = progressPathFor(args);
+  if (!existsSync(file)) {
+    console.error(`未找到采集进度文件：${file}`);
+    console.error('请先运行 collect（默认与数据库同目录、同名加 .progress.json），或用 --progress 指定。');
+    return 1;
+  }
+  const diagnosis = ProgressReader.read(file);
+  if (args.flags.has('json')) {
+    console.log(JSON.stringify(diagnosis, null, 2));
+  } else {
+    console.log(formatProgress(diagnosis));
+  }
+  return 0;
 }
 
 async function cmdMock(args: Args): Promise<number> {
@@ -275,6 +309,8 @@ async function main(): Promise<number> {
       return cmdCollect(args);
     case 'query':
       return cmdQuery(args);
+    case 'progress':
+      return cmdProgress(args);
     case 'repair':
       return cmdRepair(args);
     case 'test': {
