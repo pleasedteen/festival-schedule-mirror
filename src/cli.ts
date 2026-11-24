@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { Store } from './db/store';
 import { FestivalDesk } from './query/desk';
 import { Collector } from './collect/collector';
+import { resolveVenueTargets } from './collect/config';
 import { formatConfirmation, formatEventLine, statusLabel } from './query/view';
 import { VENUES, VENUE_IDS, venueName } from './venues';
 import type { EventState } from './core/types';
@@ -17,8 +18,15 @@ function usage(): void {
   node dist/cli.js mock [--port 8787] [--content 1]
       启动本地模拟公告站（前台运行，Ctrl+C 结束）
 
-  node dist/cli.js collect [--site URL] [--db PATH] [--venue ID ...]
-      采集各剧场公告并写入 DuckDB
+  node dist/cli.js collect [--db PATH] [--site URL] [--venue ID ...]
+      单站采集：所有剧场都从同一站点取公告（原有用法）
+
+  node dist/cli.js collect [--db PATH] --config 剧场站点.json
+      多站采集：按剧场配置分别到各自站点采集并汇总排期
+      配置文件内容：{"grand":"http://127.0.0.1:8787","harbor":"http://127.0.0.1:8790"}
+
+  node dist/cli.js collect [--db PATH] --venue-site grand=http://host:port ...
+      多站采集：可重复，单独为剧场指定站点（也可与 --config 叠加覆盖）
 
   node dist/cli.js query event <演出编号> [--db PATH]
   node dist/cli.js query venue <剧场代码> [--db PATH]
@@ -26,11 +34,12 @@ function usage(): void {
   node dist/cli.js query pending [--db PATH]
       查询已确认排期（不联网）
 
-  node dist/cli.js repair [--db PATH] [--site URL]
-      对“待补采”公告所在剧场重新采集
+  node dist/cli.js repair [--db PATH] [--site URL] [--config 剧场站点.json]
+      对“待补采”公告所在剧场重新采集；优先沿用上次采集记录的站点，
+      并遵守站点持久化的限流恢复时刻
 
   node dist/cli.js test
-      80 秒内验证翻页恢复、公告补采与改场前后查询结果
+      80 秒内用两个本地模拟站验证采集顺序、限流恢复与跨站排期
 `);
 }
 
@@ -79,32 +88,41 @@ async function withStore<T>(path: string, fn: (store: Store) => Promise<T>): Pro
 }
 
 async function cmdCollect(args: Args): Promise<number> {
-  const site = single(args, 'site') ?? DEFAULT_SITE;
   const path = dbPath(args);
-  const venues = args.flags.get('venue') ?? VENUE_IDS;
-  const unknown = venues.filter((id) => !VENUES[id]);
-  if (unknown.length > 0) {
-    console.error(`未知剧场代码：${unknown.join(', ')}（可用：${VENUE_IDS.join(', ')}）`);
+  const onlyVenues = args.flags.get('venue') ?? undefined;
+  let targets;
+  try {
+    targets = resolveVenueTargets({
+      // 保留原单站用法：未给多站配置时，默认站点仍然是本地模拟站。
+      site: single(args, 'site') ?? DEFAULT_SITE,
+      configPath: single(args, 'config'),
+      venueSiteArgs: args.flags.get('venue-site'),
+      onlyVenues,
+    });
+  } catch (error) {
+    console.error((error as Error).message);
     return 2;
   }
 
-  console.log(`采集站点 ${site}`);
+  const sites = [...new Set(targets.map((target) => target.siteBaseUrl))];
+  console.log(`采集站点 ${sites.length === 1 ? sites[0] : sites.join('，')}`);
   console.log(`数据库   ${path}`);
   return withStore(path, async (store) => {
     const collector = new Collector({
-      baseUrl: site,
+      targets,
       store,
       log: (message) => console.log(message),
     });
-    const result = await collector.collectAll(venues);
+    const result = await collector.collectAll();
     console.log('');
     for (const venue of result.venues) {
       const mark = venue.ok ? '✓' : '✗';
       console.log(
-        `${mark} ${venue.venueId}（${venueName(venue.venueId)}）` +
+        `${mark} ${venue.venueId}（${venueName(venue.venueId)}）@${venue.siteBaseUrl}` +
           ` 版式 ${venue.layout ?? '-'} 页数 ${venue.pages}` +
           ` 公告 ${venue.announcements} 条 待补采 ${venue.pending}` +
           ` 翻页恢复 ${venue.recoveries} 次 限流等待 ${venue.rateLimitWaits} 次` +
+          (venue.skipped ? ' 已跳过（站点限流未恢复）' : '') +
           (venue.error ? ` 错误：${venue.error}` : ''),
       );
     }
@@ -217,7 +235,6 @@ async function cmdQuery(args: Args): Promise<number> {
 
 async function cmdRepair(args: Args): Promise<number> {
   const path = dbPath(args);
-  const site = single(args, 'site') ?? DEFAULT_SITE;
   return withStore(path, async (store) => {
     const desk = new FestivalDesk(store);
     const pending = await desk.pendingReparse();
@@ -225,14 +242,41 @@ async function cmdRepair(args: Args): Promise<number> {
       console.log('没有待补采公告');
       return 0;
     }
-    const venues = [...new Set(pending.map((row) => row.venueId))];
-    console.log(`待补采涉及剧场：${venues.join(', ')}；重新采集…`);
+    const venueIds = [...new Set(pending.map((row) => row.venueId))];
+    // 优先沿用每个剧场上次采集时记录的站点，再用命令行配置兜底。
+    const history = new Map(
+      (await store.venueSyncState())
+        .filter((record) => record.siteBaseUrl)
+        .map((record) => [record.venueId, record.siteBaseUrl as string]),
+    );
+    let fallback;
+    try {
+      fallback = resolveVenueTargets({
+        site: single(args, 'site') ?? DEFAULT_SITE,
+        configPath: single(args, 'config'),
+        venueSiteArgs: args.flags.get('venue-site'),
+        onlyVenues: venueIds,
+      });
+    } catch (error) {
+      console.error((error as Error).message);
+      return 2;
+    }
+    const targets = fallback.map((target) => ({
+      venueId: target.venueId,
+      siteBaseUrl: history.get(target.venueId) ?? target.siteBaseUrl,
+    }));
+    console.log(
+      `待补采涉及剧场：${venueIds.join(', ')}；重新采集…`,
+    );
+    for (const target of targets) {
+      console.log(`  ${target.venueId} → ${target.siteBaseUrl}`);
+    }
     const collector = new Collector({
-      baseUrl: site,
+      targets,
       store,
       log: (message) => console.log(message),
     });
-    const result = await collector.collectAll(venues);
+    const result = await collector.collectAll();
     const remaining = await desk.pendingReparse();
     console.log(
       `补采完成：${result.venues.map((venue) => `${venue.venueId} ${venue.ok ? '成功' : '失败'}`).join('，')}`,

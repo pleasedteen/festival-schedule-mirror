@@ -103,6 +103,7 @@ function canonicalUrl(raw: string): string {
 
 export interface VenueSyncRecord {
   venueId: string;
+  siteBaseUrl: string | null;
   runAt: string;
   pages: number;
   recoveries: number;
@@ -110,6 +111,14 @@ export interface VenueSyncRecord {
   status: string;
   lastError: string | null;
   announcements: number;
+}
+
+export interface SiteRateLimitRecord {
+  siteBaseUrl: string;
+  /** 站点通过 Retry-After 给出的绝对恢复时刻。 */
+  resumeAt: string;
+  requestedMs: number;
+  updatedAt: string;
 }
 
 export class Store {
@@ -157,6 +166,7 @@ export class Store {
     await this.connection.run(`
       CREATE TABLE IF NOT EXISTS venue_sync (
         venue_id VARCHAR PRIMARY KEY,
+        site_base_url VARCHAR,
         last_run_at VARCHAR NOT NULL,
         pages INTEGER NOT NULL,
         recoveries INTEGER NOT NULL,
@@ -164,6 +174,25 @@ export class Store {
         status VARCHAR NOT NULL,
         last_error VARCHAR,
         announcement_count INTEGER NOT NULL
+      )
+    `);
+    // 旧库可能没有 site_base_url 列：按信息架构补齐，保留历史数据。
+    const columns = await this.connection.runAndReadAll(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'venue_sync' AND column_name = 'site_base_url'`,
+    );
+    if (columns.getRowObjects().length === 0) {
+      await this.connection.run(
+        `ALTER TABLE venue_sync ADD COLUMN site_base_url VARCHAR`,
+      );
+    }
+    // 站点级限流状态：按站点保存恢复时刻，重启 / repair 仍遵守站点给出的时间。
+    await this.connection.run(`
+      CREATE TABLE IF NOT EXISTS site_rate_limits (
+        site_base_url VARCHAR PRIMARY KEY,
+        resume_at VARCHAR NOT NULL,
+        requested_ms BIGINT NOT NULL,
+        updated_at VARCHAR NOT NULL
       )
     `);
     // 派生表：服务台对外唯一使用的“已确认排期”。
@@ -338,9 +367,10 @@ export class Store {
 
   async recordVenueSync(record: VenueSyncRecord): Promise<void> {
     await this.connection.run(
-      `INSERT INTO venue_sync (venue_id, last_run_at, pages, recoveries, rate_limit_waits, status, last_error, announcement_count)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO venue_sync (venue_id, site_base_url, last_run_at, pages, recoveries, rate_limit_waits, status, last_error, announcement_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (venue_id) DO UPDATE SET
+         site_base_url = excluded.site_base_url,
          last_run_at = excluded.last_run_at,
          pages = excluded.pages,
          recoveries = excluded.recoveries,
@@ -350,6 +380,7 @@ export class Store {
          announcement_count = excluded.announcement_count`,
       [
         record.venueId,
+        record.siteBaseUrl,
         record.runAt,
         record.pages,
         record.recoveries,
@@ -367,6 +398,7 @@ export class Store {
     );
     return reader.getRowObjects().map((record) => ({
       venueId: String(record.venue_id),
+      siteBaseUrl: asString(record.site_base_url),
       runAt: String(record.last_run_at),
       pages: Number(record.pages),
       recoveries: Number(record.recoveries),
@@ -375,6 +407,42 @@ export class Store {
       lastError: asString(record.last_error),
       announcements: Number(record.announcement_count),
     }));
+  }
+
+  async upsertSiteRateLimit(record: SiteRateLimitRecord): Promise<void> {
+    await this.connection.run(
+      `INSERT INTO site_rate_limits (site_base_url, resume_at, requested_ms, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (site_base_url) DO UPDATE SET
+         resume_at = excluded.resume_at,
+         requested_ms = excluded.requested_ms,
+         updated_at = excluded.updated_at`,
+      [
+        record.siteBaseUrl,
+        record.resumeAt,
+        BigInt(record.requestedMs),
+        record.updatedAt,
+      ],
+    );
+  }
+
+  async siteRateLimits(): Promise<SiteRateLimitRecord[]> {
+    const reader = await this.connection.runAndReadAll(
+      `SELECT * FROM site_rate_limits ORDER BY site_base_url`,
+    );
+    return reader.getRowObjects().map((record) => ({
+      siteBaseUrl: String(record.site_base_url),
+      resumeAt: String(record.resume_at),
+      requestedMs: Number(record.requested_ms),
+      updatedAt: String(record.updated_at),
+    }));
+  }
+
+  async deleteSiteRateLimit(siteBaseUrl: string): Promise<void> {
+    await this.connection.run(
+      `DELETE FROM site_rate_limits WHERE site_base_url = ?`,
+      [siteBaseUrl],
+    );
   }
 
   /**

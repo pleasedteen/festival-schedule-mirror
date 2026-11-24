@@ -2,6 +2,8 @@ import type { AnnouncementRow } from '../core/types';
 import { computeEffective } from '../core/effective';
 import { normalizeDateTime, parseRetryAfter } from '../core/time';
 import { parsePage } from '../parse/parse';
+import { RateLimitGate, SiteRateLimitError } from '../core/rateLimit';
+import type { Store, SiteRateLimitRecord } from '../db/store';
 
 export type Check = (name: string, condition: boolean, detail?: string) => void;
 
@@ -184,4 +186,104 @@ export function runUnitChecks(check: Check): void {
     '待补采说明包含来源',
     (pendingEvent.pendingReparseNote ?? '').includes('harbor'),
   );
+}
+
+/** 只实现闸门用到的持久化接口的内存 Store，避免单元检查依赖 DuckDB。 */
+class MemoryRateLimitStore {
+  private readonly rows = new Map<string, SiteRateLimitRecord>();
+
+  async upsertSiteRateLimit(record: SiteRateLimitRecord): Promise<void> {
+    this.rows.set(record.siteBaseUrl, { ...record });
+  }
+
+  async siteRateLimits(): Promise<SiteRateLimitRecord[]> {
+    return [...this.rows.values()];
+  }
+
+  async deleteSiteRateLimit(siteBaseUrl: string): Promise<void> {
+    this.rows.delete(siteBaseUrl);
+  }
+}
+
+/** 站点级限流闸门的边界检查（异步部分）。 */
+export async function runRateLimitGateChecks(check: Check): Promise<void> {
+  const site = 'http://127.0.0.1:8801';
+  const otherSite = 'http://127.0.0.1:8802';
+
+  // 1) 未超上限：等待 Retry-After 后继续，恢复成功时清除记录。
+  {
+    const store = new MemoryRateLimitStore() as unknown as Store;
+    let slept = 0;
+    const gate = new RateLimitGate({
+      store,
+      maxWaitMs: 5000,
+      sleepFn: async (ms) => {
+        slept += ms;
+      },
+    });
+    await gate.noteRateLimit(site, 1000, new Date().toISOString());
+    check('限流等待按 Retry-After 睡眠', slept === 1000, `睡眠 ${slept}ms`);
+    check('限流期间闸门处于激活状态', await gate.isActive(site));
+    check('其他站点不受同站限流影响', !(await gate.isActive(otherSite)));
+    await gate.clear(site);
+    check('站点恢复后闸门关闭', !(await gate.isActive(site)));
+    check('恢复后持久化记录被删除', (await store.siteRateLimits()).length === 0);
+  }
+
+  // 2) 超过单次上限：抛出并保留站点给出的恢复时刻。
+  {
+    const store = new MemoryRateLimitStore() as unknown as Store;
+    const gate = new RateLimitGate({
+      store,
+      maxWaitMs: 800,
+      sleepFn: async () => undefined,
+    });
+    let threw = false;
+    try {
+      await gate.noteRateLimit(site, 3000, new Date().toISOString());
+    } catch (error) {
+      threw =
+        error instanceof SiteRateLimitError &&
+        error.siteBaseUrl === site &&
+        Date.parse(error.resumeAt) > Date.now();
+    }
+    check('等待超上限时抛出 SiteRateLimitError', threw);
+    check('超上限后同站剧场仍被闸门拦截', await gate.isActive(site));
+    const rows = await store.siteRateLimits();
+    check('超上限的恢复时刻已持久化', rows.length === 1 && rows[0].siteBaseUrl === site);
+  }
+
+  // 3) hydrate：重启后读入恢复时刻；未到点跳过，到点放行并清理过期记录。
+  {
+    const store = new MemoryRateLimitStore() as unknown as Store;
+    const future = new Date(Date.now() + 60_000).toISOString();
+    const past = new Date(Date.now() - 1000).toISOString();
+    await store.upsertSiteRateLimit({
+      siteBaseUrl: site,
+      resumeAt: future,
+      requestedMs: 60_000,
+      updatedAt: new Date().toISOString(),
+    });
+    await store.upsertSiteRateLimit({
+      siteBaseUrl: otherSite,
+      resumeAt: past,
+      requestedMs: 1000,
+      updatedAt: new Date().toISOString(),
+    });
+    const gate = new RateLimitGate({
+      store,
+      maxWaitMs: 5000,
+      sleepFn: async () => undefined,
+    });
+    await gate.hydrate();
+    check('hydrate 后未到恢复时刻的站点仍被拦截', await gate.isActive(site));
+    check('hydrate 时清理已过期的限流记录', !(await gate.isActive(otherSite)));
+    let skipped = false;
+    try {
+      await gate.awaitRecovery(site);
+    } catch (error) {
+      skipped = error instanceof SiteRateLimitError;
+    }
+    check('未到恢复时刻且超上限时 awaitRecovery 直接抛出', skipped);
+  }
 }

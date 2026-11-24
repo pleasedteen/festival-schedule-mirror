@@ -1,21 +1,29 @@
 import { VENUE_IDS } from '../venues';
 import { parsePage } from '../parse/parse';
 import { formatDuration, parseRetryAfter, sleep } from '../core/time';
+import { RateLimitGate, SiteRateLimitError } from '../core/rateLimit';
+import type { VenueTarget } from './config';
 import type { Store } from '../db/store';
 import type { AnnouncementInput } from '../core/types';
 
 export interface CollectorOptions {
-  baseUrl: string;
+  /** 单站用法：所有剧场都从该站点采集（保留原 --site 行为）。 */
+  baseUrl?: string;
+  /** 多站用法：按剧场配置各自的站点；与 baseUrl 二选一。 */
+  targets?: VenueTarget[];
   store: Store;
   maxPages?: number;
   maxRateLimitWaitMs?: number;
   /** 注入日志，测试里可静默。 */
   log?: (message: string) => void;
   sleepFn?: (ms: number) => Promise<void>;
+  /** 复用已有闸门（repair 与 collect 共享同一份限流状态时注入）。 */
+  gate?: RateLimitGate;
 }
 
 export interface VenueCollectResult {
   venueId: string;
+  siteBaseUrl: string;
   pages: number;
   announcements: number;
   layout: string | null;
@@ -24,6 +32,8 @@ export interface VenueCollectResult {
   inserted: number;
   changed: number;
   pending: number;
+  /** 未到站点恢复时刻、本轮跳过采集时为 true。 */
+  skipped: boolean;
   ok: boolean;
   error: string | null;
 }
@@ -48,7 +58,7 @@ function createCookieJar(): CookieJar {
       if (cookies.size === 0) return undefined;
       return [...cookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
     },
-    absorb(response: Response) {
+    absorb(response) {
       const setCookie = response.headers.getSetCookie?.() ?? [];
       for (const line of setCookie) {
         const [pair] = line.split(';');
@@ -78,32 +88,81 @@ interface FetchOutcome {
 }
 
 /**
- * 单剧场采集：从入口页开始翻页；遇到 429 按 Retry-After 等待；
- * 遇到翻页签名失效（409）则重新取得入口页并回到可用的翻页位置。
+ * 多剧场采集：按“剧场 → 站点”配置分组，同一站点的剧场共享会话与限流闸门，
+ * 一站 429 后同站剧场一并等到恢复时刻，其他站点照常采集。
  */
 export class Collector {
-  private readonly baseUrl: string;
   private readonly store: Store;
   private readonly maxPages: number;
   private readonly maxRateLimitWaitMs: number;
   private readonly log: (message: string) => void;
   private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly gate: RateLimitGate;
+  private readonly singleSite: string | null;
+  private readonly initialTargets: VenueTarget[] | null;
+  private readonly jars = new Map<string, CookieJar>();
 
   constructor(options: CollectorOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/$/, '');
     this.store = options.store;
     this.maxPages = options.maxPages ?? 30;
     this.maxRateLimitWaitMs = options.maxRateLimitWaitMs ?? 15_000;
     this.log = options.log ?? (() => undefined);
     this.sleepFn = options.sleepFn ?? sleep;
+    this.singleSite = options.baseUrl ? options.baseUrl.replace(/\/$/, '') : null;
+    this.initialTargets = options.targets ? options.targets.map((target) => ({ ...target })) : null;
+    if (!this.singleSite && !this.initialTargets) {
+      throw new Error('Collector 需要 baseUrl（单站）或 targets（多站）配置');
+    }
+    this.gate =
+      options.gate ??
+      new RateLimitGate({
+        store: this.store,
+        maxWaitMs: this.maxRateLimitWaitMs,
+        log: this.log,
+        sleepFn: this.sleepFn,
+      });
+  }
+
+  /** 当前生效的“剧场 → 站点”清单；collectAll 可只选其中部分剧场。 */
+  private targetsFor(venueIds: string[] | undefined): VenueTarget[] {
+    if (this.initialTargets) {
+      const wanted = venueIds ? new Set(venueIds) : null;
+      const targets = wanted
+        ? this.initialTargets.filter((target) => wanted.has(target.venueId))
+        : this.initialTargets;
+      const known = new Set(targets.map((target) => target.venueId));
+      const unresolved = venueIds?.filter((id) => !known.has(id)) ?? [];
+      if (unresolved.length > 0) {
+        throw new Error(`剧场 ${unresolved.join(', ')} 未配置采集站点`);
+      }
+      return targets;
+    }
+    const ids = venueIds && venueIds.length > 0 ? venueIds : VENUE_IDS;
+    return ids.map((venueId) => ({
+      venueId,
+      siteBaseUrl: this.singleSite as string,
+    }));
+  }
+
+  private jarFor(siteBaseUrl: string): CookieJar {
+    let jar = this.jars.get(siteBaseUrl);
+    if (!jar) {
+      jar = createCookieJar();
+      this.jars.set(siteBaseUrl, jar);
+    }
+    return jar;
   }
 
   private async fetchPage(
+    siteBaseUrl: string,
     url: string,
     jar: CookieJar,
   ): Promise<FetchOutcome> {
     let retriedAfterMs: number | null = null;
     for (let attempt = 0; attempt < 4; attempt += 1) {
+      // 请求前先过站点闸门：同站另一个剧场刚被限流时，这里直接等到恢复时刻。
+      await this.gate.awaitRecovery(siteBaseUrl);
+
       const headers: Record<string, string> = {
         accept: 'text/html,application/xhtml+xml',
         'user-agent': 'theatre-festival-desk/1.0 (+local collector)',
@@ -129,21 +188,9 @@ export class Collector {
 
       if (response.status === 429) {
         const delay = parseRetryAfter(response.headers.get('retry-after')) ?? 1000;
-        if (delay > this.maxRateLimitWaitMs) {
-          return {
-            ok: false,
-            status: 429,
-            html: '',
-            url,
-            rateLimited: true,
-            retriedAfterMs: null,
-            recovery: false,
-            error: `限流等待 ${formatDuration(delay)} 超过上限`,
-          };
-        }
         retriedAfterMs = (retriedAfterMs ?? 0) + delay;
-        this.log(`  限流：${url} 返回 429，按 Retry-After 等待 ${formatDuration(delay)}`);
-        await this.sleepFn(delay);
+        // 超过单次上限时抛出，由 collectVenue 记录为站点限流失败并跳过同站后续剧场。
+        await this.gate.noteRateLimit(siteBaseUrl, delay, new Date().toISOString());
         continue;
       }
 
@@ -160,6 +207,8 @@ export class Collector {
           error: null,
         };
       }
+      // 成功拿到页面：站点已恢复，清除可能残留的限流记录。
+      if (await this.gate.isActive(siteBaseUrl)) await this.gate.clear(siteBaseUrl);
       return {
         ok: response.ok,
         status: response.status,
@@ -183,9 +232,14 @@ export class Collector {
     };
   }
 
-  async collectVenue(venueId: string): Promise<VenueCollectResult> {
-    const jar = createCookieJar();
-    const entryUrl = `${this.baseUrl}/venue/${encodeURIComponent(venueId)}`;
+  async collectVenue(
+    venueId: string,
+    siteBaseUrl?: string,
+  ): Promise<VenueCollectResult> {
+    const site = (siteBaseUrl ?? this.singleSite)?.replace(/\/$/, '');
+    if (!site) throw new Error(`剧场 ${venueId} 未配置采集站点`);
+    const jar = this.jarFor(site);
+    const entryUrl = `${site}/venue/${encodeURIComponent(venueId)}`;
     let pages = 0;
     let recoveries = 0;
     let rateLimitWaits = 0;
@@ -194,12 +248,66 @@ export class Collector {
     let pending = 0;
     let layout: string | null = null;
 
+    // 重启 / repair 场景：站点给出的恢复时刻未到且超出单次上限，直接跳过，不发起请求。
+    const pendingLimit = await this.gate.activePending(site);
+    if (pendingLimit) {
+      const remaining = Date.parse(pendingLimit.resumeAt) - Date.now();
+      if (remaining > this.maxRateLimitWaitMs) {
+        const message =
+          `站点限流恢复时刻 ${pendingLimit.resumeAt} 未到（还需 ${formatDuration(remaining)}），本轮跳过 ${venueId}`;
+        this.log(`  ${message}`);
+        await this.store.recordVenueSync({
+          venueId,
+          siteBaseUrl: site,
+          runAt: new Date().toISOString(),
+          pages: 0,
+          recoveries: 0,
+          rateLimitWaits: 0,
+          status: 'rate_limited',
+          lastError: message,
+          announcements: 0,
+        });
+        return {
+          venueId,
+          siteBaseUrl: site,
+          pages: 0,
+          announcements: 0,
+          layout: null,
+          recoveries: 0,
+          rateLimitWaits: 0,
+          inserted: 0,
+          changed: 0,
+          pending: 0,
+          skipped: true,
+          ok: false,
+          error: message,
+        };
+      }
+    }
+
     let nextUrl: string | null = entryUrl;
     let pageNo = 1;
     let failures = 0;
 
     while (nextUrl && pages < this.maxPages) {
-      const outcome = await this.fetchPage(nextUrl, jar);
+      let outcome: FetchOutcome;
+      try {
+        outcome = await this.fetchPage(site, nextUrl, jar);
+      } catch (error) {
+        if (error instanceof SiteRateLimitError) {
+          return this.failure(
+            venueId,
+            site,
+            pages,
+            layout,
+            recoveries,
+            rateLimitWaits,
+            `限流等待超过上限：站点恢复时刻 ${error.resumeAt}`,
+            true,
+          );
+        }
+        throw error;
+      }
       if (outcome.retriedAfterMs !== null) rateLimitWaits += 1;
 
       if (outcome.recovery) {
@@ -207,7 +315,16 @@ export class Collector {
         recoveries += 1;
         failures += 1;
         if (failures > 4) {
-          return this.failure(venueId, pages, layout, recoveries, rateLimitWaits, '翻页位置多次失效');
+          return this.failure(
+            venueId,
+            site,
+            pages,
+            layout,
+            recoveries,
+            rateLimitWaits,
+            '翻页位置多次失效',
+            false,
+          );
         }
         this.log(`  翻页凭据失效（409）：${nextUrl} → 重新取得入口页`);
         nextUrl = entryUrl;
@@ -218,6 +335,7 @@ export class Collector {
       if (!outcome.ok) {
         return this.failure(
           venueId,
+          site,
           pages,
           layout,
           recoveries,
@@ -225,6 +343,7 @@ export class Collector {
           outcome.rateLimited
             ? `限流等待超过上限（${outcome.status}）`
             : (outcome.error ?? `请求失败：HTTP ${outcome.status}`),
+          outcome.rateLimited,
         );
       }
 
@@ -234,11 +353,13 @@ export class Collector {
       } catch (error) {
         return this.failure(
           venueId,
+          site,
           pages,
           layout,
           recoveries,
           rateLimitWaits,
           (error as Error).message,
+          false,
         );
       }
 
@@ -254,7 +375,7 @@ export class Collector {
       failures = 0;
 
       this.log(
-        `  ${venueId} 第 ${pageNo} 页（${parsed.layout}）：${items.length} 条` +
+        `  ${venueId}@${site} 第 ${pageNo} 页（${parsed.layout}）：${items.length} 条` +
           (outcomeWrite.inserted || outcomeWrite.changed
             ? `，新增 ${outcomeWrite.inserted} / 更新 ${outcomeWrite.changed}`
             : '，无变化'),
@@ -276,6 +397,7 @@ export class Collector {
     const venueItems = totalItems.filter((item) => item.venueId === venueId);
     await this.store.recordVenueSync({
       venueId,
+      siteBaseUrl: site,
       runAt: new Date().toISOString(),
       pages,
       recoveries,
@@ -287,6 +409,7 @@ export class Collector {
 
     return {
       venueId,
+      siteBaseUrl: site,
       pages,
       announcements: venueItems.length,
       layout,
@@ -295,6 +418,7 @@ export class Collector {
       inserted,
       changed,
       pending,
+      skipped: false,
       ok: true,
       error: null,
     };
@@ -302,25 +426,29 @@ export class Collector {
 
   private async failure(
     venueId: string,
+    siteBaseUrl: string,
     pages: number,
     layout: string | null,
     recoveries: number,
     rateLimitWaits: number,
     error: string,
+    rateLimited: boolean,
   ): Promise<VenueCollectResult> {
-    this.log(`  ${venueId} 采集未完成：${error}`);
+    this.log(`  ${venueId}@${siteBaseUrl} 采集未完成：${error}`);
     await this.store.recordVenueSync({
       venueId,
+      siteBaseUrl,
       runAt: new Date().toISOString(),
       pages,
       recoveries,
       rateLimitWaits,
-      status: 'failed',
+      status: rateLimited ? 'rate_limited' : 'failed',
       lastError: error,
       announcements: 0,
     });
     return {
       venueId,
+      siteBaseUrl,
       pages,
       announcements: 0,
       layout,
@@ -329,24 +457,51 @@ export class Collector {
       inserted: 0,
       changed: 0,
       pending: 0,
+      skipped: rateLimited,
       ok: false,
       error,
     };
   }
 
-  /** 依次采集各剧场；单剧场失败不影响其他剧场。 */
-  async collectAll(venueIds: string[] = VENUE_IDS): Promise<CollectResult> {
+  /**
+   * 按站点分组依次采集各剧场；同站剧场共享会话与限流闸门，
+   * 单剧场失败不影响其他剧场，其他站点始终照常采集。
+   */
+  async collectAll(venueIds?: string[]): Promise<CollectResult> {
+    const targets = this.targetsFor(venueIds);
+    await this.gate.hydrate();
+
+    const grouped = new Map<string, VenueTarget[]>();
+    for (const target of targets) {
+      const group = grouped.get(target.siteBaseUrl) ?? [];
+      group.push(target);
+      grouped.set(target.siteBaseUrl, group);
+    }
+
     const venues: VenueCollectResult[] = [];
-    for (const venueId of venueIds) {
-      this.log(`采集 ${venueId}`);
-      try {
-        venues.push(await this.collectVenue(venueId));
-      } catch (error) {
-        venues.push(
-          await this.failure(venueId, 0, null, 0, 0, (error as Error).message),
-        );
+    for (const [siteBaseUrl, group] of grouped) {
+      this.log(`站点 ${siteBaseUrl}：剧场 ${group.map((target) => target.venueId).join('、')}`);
+      for (const target of group) {
+        this.log(`采集 ${target.venueId}（站点 ${siteBaseUrl}）`);
+        try {
+          venues.push(await this.collectVenue(target.venueId, siteBaseUrl));
+        } catch (error) {
+          venues.push(
+            await this.failure(
+              target.venueId,
+              siteBaseUrl,
+              0,
+              null,
+              0,
+              0,
+              (error as Error).message,
+              false,
+            ),
+          );
+        }
       }
     }
+
     // 每轮采集（含单剧场）后统一刷新派生排期；中断时这里仍会执行，
     // 保证已入库的公告与已确认的改场立即可查。
     await this.store.refreshEffective();
