@@ -7,6 +7,7 @@ import type {
   AnnouncementKind,
   Layout,
   ParsedPage,
+  ParseOptions,
 } from '../core/types';
 
 export class AnnouncementParseError extends Error {}
@@ -223,11 +224,83 @@ function parseLegacy(
   };
 }
 
-function detectLayout($: CheerioAPI): Layout | null {
+function parseCompact(
+  $: CheerioAPI,
+  el: cheerio.Cheerio<any>,
+  ctx: ParseContext,
+): AnnouncementInput {
+  const base = buildBase(el, $, ctx);
+  const title = textOf(el.find('h3.card-title').first().text());
+  const moveText = textOf(el.find('p.relocate').first().text());
+  const showRaw = textOf(el.find('span.show-time').first().attr('data-time'));
+  const doorsRaw = textOf(el.find('span.doors-time').first().attr('data-time'));
+
+  const move = resolveChangeVenues(el, moveText);
+  const fromVenue = move.from;
+  const toVenue = move.to;
+
+  let parseError: string | null = null;
+  let showTime: string | null = null;
+  let doorsTime: string | null = null;
+
+  const needTimes = base.kind === 'schedule' || base.kind === 'change';
+  try {
+    if (!base.kind) throw new AnnouncementParseError('公告类型无法识别');
+    if (!base.eventId) throw new AnnouncementParseError('缺少演出编号');
+    if (base.revision === null) throw new AnnouncementParseError('缺少修订号');
+    if (needTimes) {
+      if (!showRaw) throw new AnnouncementParseError('缺少演出时间');
+      if (!doorsRaw) throw new AnnouncementParseError('缺少入场时间');
+      showTime = extractDateTime(showRaw);
+      doorsTime = extractDateTime(doorsRaw);
+      assertDoorsBeforeShow(doorsTime, showTime);
+    }
+    if (base.kind === 'change') {
+      if (!fromVenue) throw new AnnouncementParseError('缺少原剧场');
+      if (!toVenue) throw new AnnouncementParseError('缺少新剧场');
+      if (fromVenue === toVenue) throw new AnnouncementParseError('改场两端相同');
+    }
+  } catch (error) {
+    parseError = (error as Error).message;
+  }
+
+  return {
+    annKey: '',
+    venueId: ctx.venueId,
+    siteId: base.siteId,
+    kind: base.kind,
+    eventId: base.eventId,
+    revision: base.revision,
+    title,
+    showTime,
+    doorsTime,
+    fromVenue: base.kind === 'change' ? fromVenue : null,
+    toVenue: base.kind === 'change' ? toVenue : null,
+    sourceUrl: ctx.sourceUrl,
+    sourcePage: ctx.sourcePage,
+    layout: ctx.layout,
+    rawHtml: base.rawHtml,
+    parseStatus: parseError ? 'pending' : 'parsed',
+    parseError,
+  };
+}
+
+function detectLayout($: CheerioAPI, allowed: ReadonlySet<Layout>): Layout | null {
+  // 显式声明的版式优先：容器缺失时仍要能认出版式，
+  // 这样 parsePage 才能给出“公告容器缺失”而不是笼统的“无法识别版式”。
   const declared = $('body').attr('data-layout')?.trim();
-  if (declared === 'v2' || declared === 'legacy') return declared;
-  if ($('main.announcement-list article.announcement').length > 0) return 'v2';
-  if ($('#notices.old-layout .notice').length > 0) return 'legacy';
+  if (declared === 'v2' || declared === 'legacy' || declared === 'compact') {
+    return allowed.has(declared) ? declared : null;
+  }
+  if (allowed.has('v2') && $('main.announcement-list article.announcement').length > 0) {
+    return 'v2';
+  }
+  if (allowed.has('legacy') && $('#notices.old-layout .notice').length > 0) {
+    return 'legacy';
+  }
+  if (allowed.has('compact') && $('section.board .card').length > 0) {
+    return 'compact';
+  }
   return null;
 }
 
@@ -239,7 +312,9 @@ function nextUrlOf(
   const link =
     layout === 'v2'
       ? $('nav.pager a[rel="next"]').first()
-      : $('#notices .pages a, .pages a').first();
+      : layout === 'compact'
+        ? $('nav.board-pager a[rel="next"]').first()
+        : $('#notices .pages a, .pages a').first();
   const href = textOf(link.attr('href'));
   if (!href) return null;
   try {
@@ -249,26 +324,84 @@ function nextUrlOf(
   }
 }
 
+/**
+ * 版式无法识别或公告容器缺失时的翻页兜底：即使整页无法解析，
+ * 采集器也要尽力找到“下一页”链接继续采，避免一个坏页拖垮后续页面。
+ */
+export function extractNextUrl(html: string, baseUrl: string): string | null {
+  const $ = cheerio.load(html);
+  const selectors = [
+    'nav.pager a[rel="next"]',
+    'nav.board-pager a[rel="next"]',
+    '#notices .pages a',
+    '.pages a',
+  ];
+  for (const selector of selectors) {
+    const href = textOf($(selector).first().attr('href'));
+    if (!href) continue;
+    try {
+      return new URL(href, baseUrl).toString();
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 export function parsePage(
   html: string,
   sourceUrl: string,
   page: number,
   fallbackVenueId: string,
+  options: ParseOptions = {},
 ): ParsedPage {
+  const allowed = new Set<Layout>(options.layouts ?? ['v2', 'legacy', 'compact']);
+  const tolerateMissingContainer = options.tolerateMissingContainer ?? true;
   const $ = cheerio.load(html);
-  const layout = detectLayout($);
+  const layout = detectLayout($, allowed);
   if (!layout) {
+    // 区分两种整页失败：版式完全认不出，或版式认得但公告容器缺失。
+    const declared = $('body').attr('data-layout')?.trim();
+    const declaredKnown =
+      declared === 'v2' || declared === 'legacy' || declared === 'compact';
+    if (declaredKnown && !allowed.has(declared as Layout)) {
+      throw new AnnouncementParseError(`暂不支持的公告版式：${declared}`);
+    }
     throw new AnnouncementParseError('无法识别公告版式');
   }
 
   const venueId =
     textOf($('body').attr('data-venue')) ??
     textOf($('#notices').attr('data-venue')) ??
+    textOf($('section.board').attr('data-venue')) ??
     fallbackVenueId;
 
+  let selector: string;
+  if (layout === 'v2') selector = 'main.announcement-list article.announcement';
+  else if (layout === 'legacy') selector = '#notices.old-layout .notice';
+  else selector = 'section.board .card';
+
+  let elements = $(selector).toArray();
+  if (elements.length === 0) {
+    // 解析器升级后的容错：版式认得但标准容器缺失（例如站点维护把
+    // main.announcement-list 拆掉、公告散落在外）时，退而按版式对应的
+    // 公告元素本身查找；连元素都没有才判定整页不可解析。
+    // 修复前的解析器没有这项能力，直接判损并留存原文。
+    if (tolerateMissingContainer) {
+      const fallbackSelector =
+        layout === 'v2'
+          ? 'article.announcement'
+          : layout === 'legacy'
+            ? '.notice'
+            : '.card';
+      elements = $(fallbackSelector).toArray();
+    }
+    if (elements.length === 0) {
+      throw new AnnouncementParseError('公告容器缺失或没有公告');
+    }
+  }
+
   const announcements: AnnouncementInput[] = [];
-  const elements =
-    layout === 'v2' ? $('article.announcement').toArray() : $('#notices .notice').toArray();
 
   elements.forEach((element, index) => {
     const el = $(element);
@@ -284,7 +417,9 @@ export function parsePage(
       parsed =
         layout === 'v2'
           ? parseV2($, el, ctx)
-          : parseLegacy($, el, ctx);
+          : layout === 'legacy'
+            ? parseLegacy($, el, ctx)
+            : parseCompact($, el, ctx);
     } catch (error) {
       parsed = {
         annKey: '',

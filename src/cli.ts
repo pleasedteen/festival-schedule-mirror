@@ -26,8 +26,9 @@ function usage(): void {
   node dist/cli.js query pending [--db PATH]
       查询已确认排期（不联网）
 
-  node dist/cli.js repair [--db PATH] [--site URL]
-      对“待补采”公告所在剧场重新采集
+  node dist/cli.js repair [--db PATH] [--site URL] [--offline]
+      对“待补采”公告所在剧场重新采集；
+      --offline 不联网，只回放本地留存的受损页原文（解析修复后使用）
 
   node dist/cli.js test
       80 秒内验证翻页恢复、公告补采与改场前后查询结果
@@ -104,6 +105,7 @@ async function cmdCollect(args: Args): Promise<number> {
         `${mark} ${venue.venueId}（${venueName(venue.venueId)}）` +
           ` 版式 ${venue.layout ?? '-'} 页数 ${venue.pages}` +
           ` 公告 ${venue.announcements} 条 待补采 ${venue.pending}` +
+          ` 受损页 ${venue.damagedPages}` +
           ` 翻页恢复 ${venue.recoveries} 次 限流等待 ${venue.rateLimitWaits} 次` +
           (venue.error ? ` 错误：${venue.error}` : ''),
       );
@@ -199,6 +201,13 @@ async function cmdQuery(args: Args): Promise<number> {
       for (const row of pending) {
         console.log(`  - ${row.venueId} ${row.sourceUrl}（${row.parseError ?? '解析失败'}）`);
       }
+      const damaged = await store.pendingDamagedPages();
+      console.log(`待补采受损页 ${damaged.length} 个`);
+      for (const capture of damaged) {
+        console.log(
+          `  - #${capture.seq} ${capture.venueId} 第 ${capture.sourcePage} 页 ${capture.sourceUrl}（${capture.reason}）`,
+        );
+      }
       return 0;
     }
 
@@ -217,8 +226,33 @@ async function cmdQuery(args: Args): Promise<number> {
 
 async function cmdRepair(args: Args): Promise<number> {
   const path = dbPath(args);
+  const offline = (args.flags.get('offline') ?? []).length > 0;
   const site = single(args, 'site') ?? DEFAULT_SITE;
   return withStore(path, async (store) => {
+    if (offline) {
+      const { OfflineRepair } = await import('./collect/offline-repair');
+      const pendingDamage = await store.pendingDamagedPages();
+      if (pendingDamage.length === 0) {
+        console.log('没有待补采的受损页');
+        return 0;
+      }
+      console.log(`离线补采：本地留存受损页 ${pendingDamage.length} 个，按采集顺序回放（不联网）…`);
+      for (const capture of pendingDamage) {
+        console.log(
+          `  #${capture.seq} ${capture.venueId} 第 ${capture.sourcePage} 页（${capture.reason}）`,
+        );
+      }
+      const repair = new OfflineRepair(store, {
+        log: (message: string) => console.log(message),
+      });
+      const result = await repair.run();
+      console.log(
+        `补采完成：回放 ${result.replayed}/${result.total} 个受损页，` +
+          `公告新增 ${result.inserted} / 更新 ${result.changed}，剩余受损页 ${result.remaining}`,
+      );
+      return result.ok ? 0 : 1;
+    }
+
     const desk = new FestivalDesk(store);
     const pending = await desk.pendingReparse();
     if (pending.length === 0) {

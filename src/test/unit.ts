@@ -71,6 +71,58 @@ export function runUnitChecks(check: Check): void {
   }
   check('无法识别版式时明确报错', unknownLayout);
 
+  // 新版式 compact：旧解析器（白名单不含 compact）判损，升级后可解析。
+  const compactHtml =
+    '<html><body data-venue="studio" data-layout="compact">' +
+    '<section class="board" data-venue="studio">' +
+    '<div class="card" data-kind="schedule" data-event="E-C" data-revision="1" data-site="c-1">' +
+    '<h3 class="card-title">紧凑公告</h3>' +
+    '<span class="show-time" data-time="2026-12-01 19:00">2026-12-01 19:00</span>' +
+    '<span class="doors-time" data-time="2026-12-01 18:30">2026-12-01 18:30</span>' +
+    '</div></section></body></html>';
+  let compactRejected = false;
+  try {
+    parsePage(compactHtml, 'http://mock/venue/studio', 2, 'studio', {
+      layouts: ['v2', 'legacy'],
+      tolerateMissingContainer: false,
+    });
+  } catch {
+    compactRejected = true;
+  }
+  check('旧解析器拒绝 compact 新版式（整页判损）', compactRejected);
+  const compactParsed = parsePage(compactHtml, 'http://mock/venue/studio', 2, 'studio');
+  check(
+    '升级后 compact 公告可解析',
+    compactParsed.layout === 'compact' &&
+      compactParsed.announcements[0].parseStatus === 'parsed' &&
+      compactParsed.announcements[0].eventId === 'E-C',
+  );
+
+  // 容器缺失：body 仍声明 v2，但 main.announcement-list 不见了。
+  const missingContainerHtml =
+    '<html><body data-layout="v2" data-venue="harbor">' +
+    '<div class="orphans"><article class="announcement" data-kind="schedule" ' +
+    'data-event="E-M" data-revision="1" data-site="m-1">' +
+    '<h2 class="title">散落公告</h2>' +
+    '<time class="show-time" data-time="2026-12-02 19:00"></time>' +
+    '<time class="doors-time" data-time="2026-12-02 18:30"></time>' +
+    '</article></div></body></html>';
+  let containerRejected = false;
+  try {
+    parsePage(missingContainerHtml, 'http://mock/venue/harbor', 1, 'harbor', {
+      tolerateMissingContainer: false,
+    });
+  } catch {
+    containerRejected = true;
+  }
+  check('不容忍容器缺失时整页判损', containerRejected);
+  const recovered = parsePage(missingContainerHtml, 'http://mock/venue/harbor', 1, 'harbor');
+  check(
+    '容错开启后可找回容器外的公告',
+    recovered.announcements[0].eventId === 'E-M' &&
+      recovered.announcements[0].parseStatus === 'parsed',
+  );
+
   const base = row({
     annKey: 'g:base',
     venueId: 'grand',

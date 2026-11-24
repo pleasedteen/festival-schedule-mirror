@@ -1,8 +1,8 @@
 import { VENUE_IDS } from '../venues';
-import { parsePage } from '../parse/parse';
+import { parsePage, extractNextUrl } from '../parse/parse';
 import { formatDuration, parseRetryAfter, sleep } from '../core/time';
 import type { Store } from '../db/store';
-import type { AnnouncementInput } from '../core/types';
+import type { AnnouncementInput, Layout } from '../core/types';
 
 export interface CollectorOptions {
   baseUrl: string;
@@ -12,6 +12,10 @@ export interface CollectorOptions {
   /** 注入日志，测试里可静默。 */
   log?: (message: string) => void;
   sleepFn?: (ms: number) => Promise<void>;
+  /** 解析器当前可识别的版式；缺省为全部版式。 */
+  layouts?: Layout[];
+  /** 是否容忍公告容器缺失（修复前传 false）。 */
+  tolerateMissingContainer?: boolean;
 }
 
 export interface VenueCollectResult {
@@ -24,6 +28,7 @@ export interface VenueCollectResult {
   inserted: number;
   changed: number;
   pending: number;
+  damagedPages: number;
   ok: boolean;
   error: string | null;
 }
@@ -88,6 +93,8 @@ export class Collector {
   private readonly maxRateLimitWaitMs: number;
   private readonly log: (message: string) => void;
   private readonly sleepFn: (ms: number) => Promise<void>;
+  private readonly layouts?: Layout[];
+  private readonly tolerateMissingContainer: boolean;
 
   constructor(options: CollectorOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, '');
@@ -96,6 +103,8 @@ export class Collector {
     this.maxRateLimitWaitMs = options.maxRateLimitWaitMs ?? 15_000;
     this.log = options.log ?? (() => undefined);
     this.sleepFn = options.sleepFn ?? sleep;
+    this.layouts = options.layouts;
+    this.tolerateMissingContainer = options.tolerateMissingContainer ?? true;
   }
 
   private async fetchPage(
@@ -192,6 +201,7 @@ export class Collector {
     let inserted = 0;
     let changed = 0;
     let pending = 0;
+    let damagedPages = 0;
     let layout: string | null = null;
 
     let nextUrl: string | null = entryUrl;
@@ -207,7 +217,7 @@ export class Collector {
         recoveries += 1;
         failures += 1;
         if (failures > 4) {
-          return this.failure(venueId, pages, layout, recoveries, rateLimitWaits, '翻页位置多次失效');
+          return this.failure(venueId, pages, layout, recoveries, rateLimitWaits, damagedPages, '翻页位置多次失效');
         }
         this.log(`  翻页凭据失效（409）：${nextUrl} → 重新取得入口页`);
         nextUrl = entryUrl;
@@ -222,6 +232,7 @@ export class Collector {
           layout,
           recoveries,
           rateLimitWaits,
+          damagedPages,
           outcome.rateLimited
             ? `限流等待超过上限（${outcome.status}）`
             : (outcome.error ?? `请求失败：HTTP ${outcome.status}`),
@@ -230,16 +241,35 @@ export class Collector {
 
       let parsed;
       try {
-        parsed = parsePage(outcome.html, outcome.url, pageNo, venueId);
+        parsed = parsePage(outcome.html, outcome.url, pageNo, venueId, {
+          layouts: this.layouts,
+          tolerateMissingContainer: this.tolerateMissingContainer,
+        });
       } catch (error) {
-        return this.failure(
+        // 整页无法可靠解析（版式认不出 / 公告容器缺失）：
+        // 留存原文待离线补采，不影响同剧场后续页面与其他剧场。
+        const reason = (error as Error).message;
+        damagedPages += 1;
+        const seq = await this.store.recordDamagedPage({
           venueId,
-          pages,
-          layout,
-          recoveries,
-          rateLimitWaits,
-          (error as Error).message,
+          sourceUrl: outcome.url,
+          sourcePage: pageNo,
+          reason,
+          rawHtml: outcome.html,
+          capturedAt: new Date().toISOString(),
+        });
+        this.log(
+          `  ${venueId} 第 ${pageNo} 页整页无法解析（${reason}），原文留存为受损页 #${seq}，继续翻页`,
         );
+        // 尽力从坏页里找“下一页”链接继续采；找不到才结束本剧场。
+        const fallbackNext = extractNextUrl(outcome.html, outcome.url);
+        if (fallbackNext) {
+          pageNo += 1;
+          nextUrl = fallbackNext;
+        } else {
+          nextUrl = null;
+        }
+        continue;
       }
 
       layout ??= parsed.layout;
@@ -295,6 +325,7 @@ export class Collector {
       inserted,
       changed,
       pending,
+      damagedPages,
       ok: true,
       error: null,
     };
@@ -306,6 +337,7 @@ export class Collector {
     layout: string | null,
     recoveries: number,
     rateLimitWaits: number,
+    damagedPages: number,
     error: string,
   ): Promise<VenueCollectResult> {
     this.log(`  ${venueId} 采集未完成：${error}`);
@@ -329,6 +361,7 @@ export class Collector {
       inserted: 0,
       changed: 0,
       pending: 0,
+      damagedPages,
       ok: false,
       error,
     };
@@ -343,7 +376,7 @@ export class Collector {
         venues.push(await this.collectVenue(venueId));
       } catch (error) {
         venues.push(
-          await this.failure(venueId, 0, null, 0, 0, (error as Error).message),
+          await this.failure(venueId, 0, null, 0, 0, 0, (error as Error).message),
         );
       }
     }

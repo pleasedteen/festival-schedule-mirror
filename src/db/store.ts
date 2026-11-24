@@ -6,6 +6,7 @@ import type {
   AnnouncementInput,
   AnnouncementRow,
   ChangeConfirmation,
+  DamagedPageRow,
   EventState,
 } from '../core/types';
 
@@ -206,6 +207,21 @@ export class Store {
         PRIMARY KEY (event_id, revision)
       )
     `);
+    // 整页无法解析时留存的原始页面：只追加，不覆盖。
+    // 同一页坏两次会产生两行，离线补采严格按 seq 顺序回放，
+    // 保证最终结果与“顺序采集”一致。
+    await this.connection.run(`
+      CREATE TABLE IF NOT EXISTS damaged_page_captures (
+        seq INTEGER PRIMARY KEY,
+        venue_id VARCHAR NOT NULL,
+        source_url VARCHAR NOT NULL,
+        source_page INTEGER NOT NULL,
+        reason VARCHAR NOT NULL,
+        raw_html VARCHAR NOT NULL,
+        captured_at VARCHAR NOT NULL,
+        repaired_at VARCHAR
+      )
+    `);
     await this.selfHealEffective();
   }
 
@@ -245,8 +261,16 @@ export class Store {
   /**
    * 按公告键幂等写入。内容未变化时不改 updated_at，
    * 内容变化（例如公告修正）时保留 first_seen_at 并刷新 updated_at。
+   *
+   * replayAt 用于离线补采：同一页按采集顺序回放时，传入单调递增的
+   * 回放时刻作为 updated_at，保证后来的采集结果覆盖早先结果，
+   * 与在线顺序采集的折叠顺序一致。
    */
-  async upsertPage(items: AnnouncementInput[], now: string): Promise<{
+  async upsertPage(
+    items: AnnouncementInput[],
+    now: string,
+    replayAt?: string,
+  ): Promise<{
     inserted: number;
     changed: number;
     unchanged: number;
@@ -315,7 +339,7 @@ export class Store {
             item.rawHtml,
             item.parseStatus,
             item.parseError,
-            now,
+            replayAt ?? now,
             item.annKey,
           ],
         );
@@ -334,6 +358,60 @@ export class Store {
       `SELECT ${COLUMNS.join(', ')} FROM announcements WHERE parse_status = 'pending' ORDER BY ann_key`,
     );
     return reader.getRowObjects().map(rowFromRecord);
+  }
+
+  /** 留存一页无法可靠解析的原始页面（同一页坏两次会各留一行）。 */
+  async recordDamagedPage(input: {
+    venueId: string;
+    sourceUrl: string;
+    sourcePage: number;
+    reason: string;
+    rawHtml: string;
+    capturedAt: string;
+  }): Promise<number> {
+    const seqReader = await this.connection.runAndReadAll(
+      `SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM damaged_page_captures`,
+    );
+    const seq = Number(seqReader.getRowObjects()[0].next_seq);
+    await this.connection.run(
+      `INSERT INTO damaged_page_captures
+         (seq, venue_id, source_url, source_page, reason, raw_html, captured_at, repaired_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL)`,
+      [
+        seq,
+        input.venueId,
+        canonicalUrl(input.sourceUrl),
+        input.sourcePage,
+        input.reason,
+        input.rawHtml,
+        input.capturedAt,
+      ],
+    );
+    return seq;
+  }
+
+  /** 尚未补采的受损页，严格按采集顺序返回。 */
+  async pendingDamagedPages(): Promise<DamagedPageRow[]> {
+    const reader = await this.connection.runAndReadAll(
+      `SELECT * FROM damaged_page_captures WHERE repaired_at IS NULL ORDER BY seq`,
+    );
+    return reader.getRowObjects().map((record) => ({
+      seq: Number(record.seq),
+      venueId: String(record.venue_id),
+      sourceUrl: String(record.source_url),
+      sourcePage: Number(record.source_page),
+      reason: String(record.reason),
+      rawHtml: String(record.raw_html),
+      capturedAt: String(record.captured_at),
+      repairedAt: asString(record.repaired_at),
+    }));
+  }
+
+  async markDamagedPageRepaired(seq: number, repairedAt: string): Promise<void> {
+    await this.connection.run(
+      `UPDATE damaged_page_captures SET repaired_at = ? WHERE seq = ?`,
+      [repairedAt, seq],
+    );
   }
 
   async recordVenueSync(record: VenueSyncRecord): Promise<void> {

@@ -23,6 +23,7 @@ interface MockStats {
   rateLimited: number;
   aborted: number;
   sessionRotations: number;
+  damagedPagesServed: number;
 }
 
 function escapeHtml(value: string): string {
@@ -154,6 +155,104 @@ function renderRecoveryPage(venueId: string): string {
 </body></html>`;
 }
 
+/**
+ * 故障注入用的“紧凑公告板”版式：
+ * 旧版解析器既不认识 data-layout="compact"，也没有 section.board 容器，
+ * 会把整页判为无法识别；解析器升级后即可正常解析（离线补采演示）。
+ */
+function renderCompactItem(item: MockItem): string {
+  const title = escapeHtml(item.title);
+  const kind = escapeHtml(item.kind);
+  const base = `data-kind="${kind}" data-event="${escapeHtml(item.eventId)}" data-revision="${item.revision}" data-site="${escapeHtml(item.siteId)}"`;
+  const lines: string[] = [];
+  if (item.kind !== 'cancel') {
+    const { showTime, doorsTime } = timesFor(item);
+    if (showTime) {
+      lines.push(
+        `<span class="show-time" data-time="${escapeHtml(showTime)}">${escapeHtml(showTime)}</span>`,
+      );
+    }
+    if (doorsTime) {
+      lines.push(
+        `<span class="doors-time" data-time="${escapeHtml(doorsTime)}">${escapeHtml(doorsTime)}</span>`,
+      );
+    }
+    if (item.kind === 'change') {
+      lines.push(
+        `<p class="relocate" data-from="${escapeHtml(item.fromVenue ?? '')}" data-to="${escapeHtml(item.toVenue ?? '')}">由 ${escapeHtml(venueLabel(item.fromVenue ?? ''))} 迁至 ${escapeHtml(venueLabel(item.toVenue ?? ''))}</p>`,
+      );
+    }
+  } else {
+    lines.push('<span class="cancelled">本场演出取消</span>');
+  }
+  return `<div class="card" ${base}>
+  <h3 class="card-title">${title}</h3>
+  ${lines.join('\n  ')}
+</div>`;
+}
+
+/** 版式完全无法识别：不带任何已知 data-layout，容器也是全新的。 */
+function renderUnknownLayoutPage(
+  content: VenueContent,
+  page: number,
+  nextHref: string | null,
+): string {
+  const total = pageCount(content);
+  const items = itemsForPage(content, page);
+  const venue = escapeHtml(content.venueId);
+  const label = `${page} / ${total}`;
+  const nav = nextHref
+    ? `<nav class="board-pager"><span class="page-label">${label}</span><a rel="next" href="${escapeHtml(nextHref)}">下一页</a></nav>`
+    : `<nav class="board-pager"><span class="page-label">${label}</span><span>没有更多公告</span></nav>`;
+  return `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>${venueLabel(content.venueId)} · 公告板</title></head>
+<body data-venue="${venue}">
+<header><h1>${venueLabel(content.venueId)} · 公告板</h1></header>
+<section class="board" data-venue="${venue}">
+${items.map(renderCompactItem).join('\n')}
+</section>
+${nav}
+</body>
+</html>`;
+}
+
+/** 版式认得（v2）但公告容器缺失：article 散落在 main 之外。 */
+function renderMissingContainerPage(
+  content: VenueContent,
+  page: number,
+  nextHref: string | null,
+): string {
+  const total = pageCount(content);
+  const items = itemsForPage(content, page);
+  const venue = escapeHtml(content.venueId);
+  const label = `${page} / ${total}`;
+  const nav = nextHref
+    ? `<nav class="pager"><span class="page-label">第 ${label} 页</span><a rel="next" href="${escapeHtml(nextHref)}">下一页</a></nav>`
+    : `<nav class="pager"><span class="page-label">第 ${label} 页</span><span>没有更多公告</span></nav>`;
+  return `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>${venueLabel(content.venueId)} · 公告</title></head>
+<body data-layout="v2" data-venue="${venue}">
+<header><h1>${venueLabel(content.venueId)} · 公告（容器维护中）</h1></header>
+<div class="orphans">
+${items.map(renderV2Item).join('\n')}
+</div>
+${nav}
+</body>
+</html>`;
+}
+
+type DamageMode = 'unknown-layout' | 'missing-container';
+
+interface DamageRule {
+  mode: DamageMode;
+  /** 已下发的受损页次数（每次命中累加）。 */
+  hits: number;
+  /** 最多下发多少次；缺省/0 表示持续生效，直到显式清除。 */
+  times: number;
+}
+
 export interface MockSiteOptions {
   host?: string;
   port?: number;
@@ -175,6 +274,10 @@ export class MockSite {
   private rotateAfter: number | null = null;
   private rateLimit: { seconds: number; remaining: number } | null = null;
   private abortAfter: number | null = null;
+  /** 按剧场注入整页故障：key = venueId:page，命中一次扣减一次。 */
+  private damageRules = new Map<string, DamageRule>();
+  /** 按剧场覆盖内容版本（用于模拟同一公告回到旧内容）。 */
+  private venueVersionOverride = new Map<string, number>();
   private venueRequestCount = 0;
   private readonly stats: MockStats = {
     requests: 0,
@@ -183,6 +286,7 @@ export class MockSite {
     rateLimited: 0,
     aborted: 0,
     sessionRotations: 0,
+    damagedPagesServed: 0,
   };
   private listening: Promise<void> | null = null;
   private boundPort = 0;
@@ -305,7 +409,8 @@ export class MockSite {
     }
 
     const venueId = decodeURIComponent((entry ?? paged)![1]);
-    const content = venueContent(this.contentVersion, venueId);
+    const contentVersion = this.venueVersionOverride.get(venueId) ?? this.contentVersion;
+    const content = venueContent(contentVersion, venueId);
     if (!content) {
       res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
       res.end('unknown venue');
@@ -343,8 +448,9 @@ export class MockSite {
           ? `/venue/${venueId}/page/2?sig=${this.signature(sid, state, venueId, 2)}`
           : null;
       this.stats.venuePagesServed += 1;
+      const damaged = this.takeDamage(venueId, 1, content, nextHref);
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(renderPage(content, 1, nextHref));
+      res.end(damaged ?? renderPage(content, 1, nextHref));
       return;
     }
 
@@ -376,8 +482,27 @@ export class MockSite {
         ? `/venue/${venueId}/page/${page + 1}?sig=${this.signature(sid!, state!, venueId, page + 1)}`
         : null;
     this.stats.venuePagesServed += 1;
+    const damaged = this.takeDamage(venueId, page, content, nextHref);
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(renderPage(content, page, nextHref));
+    res.end(damaged ?? renderPage(content, page, nextHref));
+  }
+
+  /** 命中故障规则时返回受损页面 HTML，否则返回 null（正常页面）。 */
+  private takeDamage(
+    venueId: string,
+    page: number,
+    content: VenueContent,
+    nextHref: string | null,
+  ): string | null {
+    const key = `${venueId}:${page}`;
+    const rule = this.damageRules.get(key);
+    if (!rule) return null;
+    if (rule.times > 0 && rule.hits >= rule.times) return null;
+    rule.hits += 1;
+    this.stats.damagedPagesServed += 1;
+    return rule.mode === 'missing-container'
+      ? renderMissingContainerPage(content, page, nextHref)
+      : renderUnknownLayoutPage(content, page, nextHref);
   }
 
   private async handleControl(
@@ -397,6 +522,8 @@ export class MockSite {
         this.rotateAfter = null;
         this.rateLimit = null;
         this.abortAfter = null;
+        this.damageRules.clear();
+        this.venueVersionOverride.clear();
         this.venueRequestCount = 0;
         this.stats.requests = 0;
         this.stats.venuePagesServed = 0;
@@ -404,6 +531,7 @@ export class MockSite {
         this.stats.rateLimited = 0;
         this.stats.aborted = 0;
         this.stats.sessionRotations = 0;
+        this.stats.damagedPagesServed = 0;
         if (typeof payload.contentVersion === 'number') {
           this.contentVersion = payload.contentVersion;
         }
@@ -438,6 +566,33 @@ export class MockSite {
             : Number(payload.count);
         response = { ok: true, abortAfter: this.abortAfter };
         break;
+      case 'damage': {
+        // 注入整页故障：{ venue, page, mode, times }
+        // times 为命中次数上限，0/缺省表示持续生效直到 damage/clear。
+        const venue = String(payload.venue ?? '');
+        const page = Number(payload.page ?? 1);
+        const mode = payload.mode === 'missing-container'
+          ? 'missing-container'
+          : 'unknown-layout';
+        const times = Math.max(0, Number(payload.times ?? 0));
+        this.damageRules.set(`${venue}:${page}`, { mode, hits: 0, times });
+        response = { ok: true, damage: { venue, page, mode, times } };
+        break;
+      }
+      case 'damage/clear':
+        this.damageRules.clear();
+        break;
+      case 'venue-version': {
+        // 覆盖单个剧场的内容版本，模拟同一公告回到旧内容。
+        const venue = String(payload.venue ?? '');
+        if (payload.version === null || payload.version === undefined) {
+          this.venueVersionOverride.delete(venue);
+        } else {
+          this.venueVersionOverride.set(venue, Number(payload.version));
+        }
+        response = { ok: true, venue, version: this.venueVersionOverride.get(venue) ?? null };
+        break;
+      }
       case 'stats':
         response = { ok: true, ...this.getInfo() };
         break;

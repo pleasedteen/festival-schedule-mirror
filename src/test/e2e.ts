@@ -4,11 +4,12 @@ import { join } from 'node:path';
 import { MockSite } from '../mock/server';
 import { Store } from '../db/store';
 import { Collector } from '../collect/collector';
+import { OfflineRepair } from '../collect/offline-repair';
 import { FestivalDesk } from '../query/desk';
 import { formatConfirmation, formatEventLine } from '../query/view';
 import { runUnitChecks } from './unit';
 import { venueName } from '../venues';
-import type { EventState } from '../core/types';
+import type { AnnouncementRow, ChangeConfirmation, EventState, Layout } from '../core/types';
 
 const TOTAL_BUDGET_MS = 80_000;
 
@@ -68,14 +69,94 @@ async function collect(
   store: Store,
   site: MockSite,
   venues?: string[],
+  layouts?: Layout[],
 ): Promise<Awaited<ReturnType<Collector['collectAll']>>> {
   const collector = new Collector({
     baseUrl: site.baseUrl,
     store,
     maxRateLimitWaitMs: 5000,
+    // 指定受限版式即代表“修复前的旧解析器”：不认识新版式，也不容忍容器缺失。
+    layouts,
+    tolerateMissingContainer: layouts ? false : true,
     log: (message) => console.log(`    · ${message.trim()}`),
   });
   return collector.collectAll(venues);
+}
+
+/** 语义字段：受损页用 compact 渲染，故排除 layout / rawHtml / 来源定位字段。 */
+const ANN_FIELDS: (keyof AnnouncementRow)[] = [
+  'annKey', 'venueId', 'siteId', 'kind', 'eventId', 'revision', 'title',
+  'showTime', 'doorsTime', 'fromVenue', 'toVenue', 'parseStatus', 'parseError',
+];
+
+function signature(row: AnnouncementRow): string {
+  return JSON.stringify(ANN_FIELDS.map((field) => row[field]));
+}
+
+function compareAnnouncements(
+  harness: Harness,
+  golden: AnnouncementRow[],
+  repaired: AnnouncementRow[],
+): void {
+  harness.equal('补采后公告条数与顺序采集一致', repaired.length, golden.length);
+  const goldenMap = new Map(golden.map((row) => [row.annKey, row]));
+  let matched = 0;
+  for (const row of repaired) {
+    const other = goldenMap.get(row.annKey);
+    if (other && signature(other) === signature(row)) matched += 1;
+  }
+  harness.equal('每条公告的语义内容与顺序采集逐条一致', matched, golden.length);
+}
+
+function compareEvents(
+  harness: Harness,
+  golden: EventState[],
+  repaired: EventState[],
+): void {
+  harness.equal('已确认排期条数一致', repaired.length, golden.length);
+  const goldenMap = new Map(golden.map((event) => [event.eventId, event]));
+  let matched = 0;
+  for (const event of repaired) {
+    const other = goldenMap.get(event.eventId);
+    if (!other) continue;
+    const same =
+      other.status === event.status &&
+      other.venueId === event.venueId &&
+      other.showTime === event.showTime &&
+      other.doorsTime === event.doorsTime &&
+      other.revision === event.revision &&
+      other.lastChangeKind === event.lastChangeKind &&
+      other.hasPendingChange === event.hasPendingChange &&
+      other.pendingRevision === event.pendingRevision &&
+      other.pendingReparseCount === event.pendingReparseCount;
+    if (same) matched += 1;
+  }
+  harness.equal('每个演出的折叠排期与顺序采集一致', matched, golden.length);
+}
+
+function compareConfirmations(
+  harness: Harness,
+  golden: ChangeConfirmation[],
+  repaired: ChangeConfirmation[],
+): void {
+  harness.equal('改场记录条数一致', repaired.length, golden.length);
+  const key = (item: ChangeConfirmation) => `${item.eventId}#${item.revision}`;
+  const goldenMap = new Map(golden.map((item) => [key(item), item]));
+  let matched = 0;
+  for (const item of repaired) {
+    const other = goldenMap.get(key(item));
+    if (!other) continue;
+    const same =
+      other.fromVenue === item.fromVenue &&
+      other.toVenue === item.toVenue &&
+      other.showTime === item.showTime &&
+      other.doorsTime === item.doorsTime &&
+      other.confirmed === item.confirmed &&
+      other.receivedFrom === item.receivedFrom &&
+      other.receivedTo === item.receivedTo;
+    if (same) matched += 1;
+  }
+  harness.equal('每条改场的两端确认状态与顺序采集一致', matched, golden.length);
 }
 
 export async function runE2E(): Promise<number> {
@@ -252,8 +333,232 @@ export async function runE2E(): Promise<number> {
       `编号：${byEvent?.venueId} ${byEvent?.showTime}；剧场：${byVenue?.venueId} ${byVenue?.showTime}`,
     );
 
-    /* ---------- 7. 输出最终排期 ---------- */
-    harness.section('7. 最终对外排期');
+    /* ---------- 7. 整页受损：留存原文、继续翻页、断网离线补采 ---------- */
+    harness.section('7. 整页受损采集 vs 顺序采集（断网补采对齐）');
+    await control(site, 'reset', { contentVersion: 1 });
+
+    // 7.1 顺序采集（金色基准）：解析器全版式可用，站点完全健康。
+    const goldenDir = mkdtempSync(join(tmpdir(), 'festival-golden-'));
+    const goldenPath = join(goldenDir, 'golden.duckdb');
+    const goldenStore = await Store.open(goldenPath);
+    const goldenResult = await collect(goldenStore, site);
+    harness.check(
+      '顺序采集三个剧场全部完成',
+      goldenResult.venues.every((venue) => venue.ok && venue.damagedPages === 0),
+    );
+    const goldenRows = await goldenStore.allAnnouncements();
+    const goldenEvents = await goldenStore.effectiveEvents();
+    const goldenConfs = await goldenStore.changeConfirmations();
+
+    // 7.2 受损采集：旧解析器不认识 compact；两种整页故障 + 同页坏两次。
+    // 故障规则持续生效，两轮采集都命中同一坏页，模拟“同一页先后坏两次”。
+    await control(site, 'damage', {
+      venue: 'studio', page: 2, mode: 'unknown-layout',
+    });
+    await control(site, 'damage', {
+      venue: 'harbor', page: 1, mode: 'missing-container',
+    });
+    const damagedDir = mkdtempSync(join(tmpdir(), 'festival-damaged-'));
+    const damagedPath = join(damagedDir, 'damaged.duckdb');
+    const damagedStore = await Store.open(damagedPath);
+    // 第一轮采集：两个坏页各留存一次，其余页面正常入库。
+    const damagedFirst = await collect(damagedStore, site, undefined, ['v2', 'legacy']);
+    const firstVenues = Object.fromEntries(damagedFirst.venues.map((venue) => [venue.venueId, venue]));
+    harness.check(
+      '首轮采集受损页不拖垮采集：三个剧场仍全部完成',
+      damagedFirst.venues.every((venue) => venue.ok),
+    );
+    harness.equal('首轮实验剧场坏页留存', firstVenues.studio?.damagedPages ?? 0, 1);
+    harness.equal('首轮海港剧场坏页留存', firstVenues.harbor?.damagedPages ?? 0, 1);
+    // 第二轮采集（解析仍未修复）：同样的页面再次坏掉，再各留存一次。
+    const damagedSecond = await collect(damagedStore, site, ['studio', 'harbor'], ['v2', 'legacy']);
+    const secondVenues = Object.fromEntries(damagedSecond.venues.map((venue) => [venue.venueId, venue]));
+    harness.check(
+      '二轮采集同样不中断',
+      damagedSecond.venues.every((venue) => venue.ok),
+    );
+    harness.equal('二轮实验剧场同一页再次留存', secondVenues.studio?.damagedPages ?? 0, 1);
+    harness.equal('二轮海港容器缺失再次留存', secondVenues.harbor?.damagedPages ?? 0, 1);
+
+    const secondTotals = Object.fromEntries(
+      damagedSecond.venues.map((venue) => [venue.venueId, venue.damagedPages]),
+    );
+    const dVenues = Object.fromEntries(
+      damagedFirst.venues.map((venue) => [
+        venue.venueId,
+        { ...venue, damagedPages: venue.damagedPages + (secondTotals[venue.venueId] ?? 0) },
+      ]),
+    );
+    harness.equal('实验剧场同一页先后坏两次均被留存', dVenues.studio?.damagedPages ?? 0, 2);
+    harness.equal('海港剧场容器缺失两次均被留存', dVenues.harbor?.damagedPages ?? 0, 2);
+    harness.equal('大剧院没有受损页', dVenues.grand?.damagedPages ?? 0, 0);
+    const damagedBeforeRepair = await damagedStore.pendingDamagedPages();
+    harness.equal('受损页原文共留存 4 个', damagedBeforeRepair.length, 4);
+    harness.equal(
+      '受损页按采集顺序编号（seq 单调）',
+      damagedBeforeRepair.map((capture) => capture.seq).join(','),
+      '1,2,3,4',
+    );
+    // 坏页之后的健康页面仍被采到：实验剧场共 4 页，第 2 页坏但 3/4 页入库。
+    const studioRowsDamaged = (await damagedStore.allAnnouncements()).filter(
+      (row) => row.venueId === 'studio',
+    );
+    const studioPages = new Set(studioRowsDamaged.map((row) => row.sourcePage));
+    harness.check(
+      '坏页之后仍继续翻页，后续页面正常入库',
+      studioPages.has(3) && studioPages.has(4) && !studioPages.has(2),
+      `已采页：${[...studioPages].sort().join(', ')}`,
+    );
+    const damageStats = await control(site, 'stats');
+    harness.equal(
+      '站点确实下发了 4 个受损页',
+      Number(damageStats.damagedPagesServed),
+      4,
+    );
+
+    // 7.3 解析器未修复时离线补采：一个受损页都补不了，但数据保持原样、可重试。
+    const premature = new OfflineRepair(damagedStore, {
+      layouts: ['v2', 'legacy'],
+      tolerateMissingContainer: false,
+      log: () => undefined,
+    });
+    const prematureResult = await premature.run();
+    harness.equal(
+      '解析修复前离线补采全部保留为待补采',
+      prematureResult.stillFailing,
+      4,
+    );
+    harness.equal('未修复时受损页一个都不被标记', prematureResult.replayed, 0);
+
+    // 7.4 模拟“原页下线”：关闭站点后补采必须完全离线可用。
+    await site.close();
+    // 网络守卫：离线补采期间任何 fetch 都视为失败（站点已关，请求也会报错）。
+    const realFetch = globalThis.fetch;
+    let networkCalls = 0;
+    globalThis.fetch = (async () => {
+      networkCalls += 1;
+      throw new Error('离线补采不允许发起网络请求');
+    }) as typeof fetch;
+    const offlineRepair = new OfflineRepair(damagedStore, {
+      log: (message) => console.log(`    · ${message.trim()}`),
+    });
+    let offlineThrew = false;
+    let offlineResult: Awaited<ReturnType<OfflineRepair['run']>>;
+    try {
+      offlineResult = await offlineRepair.run();
+    } catch (error) {
+      offlineThrew = true;
+      throw error;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    harness.equal('离线补采期间零网络请求', networkCalls, 0);
+    harness.check('离线补采不依赖站点在线', !offlineThrew);
+    harness.equal('断网离线补采回放全部 4 个受损页', offlineResult.replayed, 4);
+    harness.equal('断网离线补采后无剩余受损页', offlineResult.remaining, 0);
+    harness.check('离线补采成功', offlineResult.ok);
+    const repairedRows = await damagedStore.allAnnouncements();
+    compareAnnouncements(harness, goldenRows, repairedRows);
+    compareEvents(harness, goldenEvents, await damagedStore.effectiveEvents());
+    compareConfirmations(harness, goldenConfs, await damagedStore.changeConfirmations());
+
+    /* ---------- 7b. 补采中断重启：接着未完成的受损页补完 ---------- */
+    harness.section('7b. 离线补采中断后重启，仍能补完且结果一致');
+    const interruptDir = mkdtempSync(join(tmpdir(), 'festival-interrupt-'));
+    const interruptPath = join(interruptDir, 'interrupt.duckdb');
+    const interruptStore = await Store.open(interruptPath);
+    const site2 = new MockSite({ contentVersion: 1 });
+    await site2.listen(0);
+    await control(site2, 'reset', { contentVersion: 1 });
+    await control(site2, 'damage', {
+      venue: 'harbor', page: 1, mode: 'unknown-layout',
+    });
+    // 两轮采集命中同一个持续故障页，模拟同一页先后坏两次。
+    const firstCollect = await collect(interruptStore, site2, ['harbor'], ['v2', 'legacy']);
+    const secondCollect = await collect(interruptStore, site2, ['harbor'], ['v2', 'legacy']);
+    const damagedTotal =
+      firstCollect.venues[0].damagedPages + secondCollect.venues[0].damagedPages;
+    harness.equal('中断场景：两个受损页已留存', damagedTotal, 2);
+    const firstRun = new OfflineRepair(interruptStore, { maxCaptures: 1, log: () => undefined });
+    const firstResult = await firstRun.run();
+    harness.equal('补采中断：本次只回放 1 个受损页', firstResult.replayed, 1);
+    harness.check('中断状态被如实标记', firstResult.interrupted);
+    harness.equal('中断后剩余 1 个受损页', firstResult.remaining, 1);
+    // 关闭并重新打开数据库，模拟进程重启。
+    await interruptStore.close();
+    const reopened = await Store.open(interruptPath);
+    const secondRun = new OfflineRepair(reopened, { log: () => undefined });
+    const secondResult = await secondRun.run();
+    harness.equal('重启后续采只处理剩余 1 个受损页', secondResult.replayed, 1);
+    harness.equal('重启续采后受损页清空', secondResult.remaining, 0);
+    const goldenHarbor = goldenRows.filter((row) => row.venueId === 'harbor');
+    const reopenedHarbor = (await reopened.allAnnouncements()).filter(
+      (row) => row.venueId === 'harbor',
+    );
+    compareAnnouncements(harness, goldenHarbor, reopenedHarbor);
+    await site2.close();
+    rmSync(interruptDir, { recursive: true, force: true });
+
+    /* ---------- 7c. 同页坏两次 + 公告回到旧内容：按顺序回放对齐 ---------- */
+    harness.section('7c. 同页坏两次与内容回退，最终排期按采集顺序对齐');
+    const revertDir = mkdtempSync(join(tmpdir(), 'festival-revert-'));
+    const revertPath = join(revertDir, 'revert.duckdb');
+    const revertStore = await Store.open(revertPath);
+    const site3 = new MockSite({ contentVersion: 1 });
+    await site3.listen(0);
+    await control(site3, 'reset', { contentVersion: 1 });
+    // studio 第 2 页持续故障：两轮采集各留存一次 v1 原文（同页坏两次）。
+    await control(site3, 'damage', {
+      venue: 'studio', page: 2, mode: 'unknown-layout',
+    });
+    await collect(revertStore, site3, undefined, ['v2', 'legacy']);
+    await collect(revertStore, site3, ['studio'], ['v2', 'legacy']);
+    // 站点随后整体升级到 v2（公告修正），但实验剧场被单独回退到 v1（公告回到旧内容）。
+    await control(site3, 'content', { version: 2 });
+    await control(site3, 'venue-version', { venue: 'studio', version: 1 });
+    await collect(revertStore, site3, ['harbor'], ['v2', 'legacy']);
+    const revertRepair = new OfflineRepair(revertStore, { log: () => undefined });
+    const revertResult = await revertRepair.run();
+    harness.equal('回退场景：两个受损页按顺序回放完成', revertResult.replayed, 2);
+    harness.equal('回退场景：无剩余受损页', revertResult.remaining, 0);
+
+    // 金色基准：完全相同的站点操作序列，但页面始终健康（无故障注入）。
+    const revertGoldenDir = mkdtempSync(join(tmpdir(), 'festival-revert-golden-'));
+    const revertGoldenPath = join(revertGoldenDir, 'revert-golden.duckdb');
+    const revertGoldenStore = await Store.open(revertGoldenPath);
+    const site4 = new MockSite({ contentVersion: 1 });
+    await site4.listen(0);
+    await control(site4, 'reset', { contentVersion: 1 });
+    await collect(revertGoldenStore, site4);
+    await collect(revertGoldenStore, site4, ['studio']);
+    await control(site4, 'content', { version: 2 });
+    await control(site4, 'venue-version', { venue: 'studio', version: 1 });
+    await collect(revertGoldenStore, site4, ['harbor']);
+    compareAnnouncements(
+      harness,
+      await revertGoldenStore.allAnnouncements(),
+      await revertStore.allAnnouncements(),
+    );
+    compareEvents(
+      harness,
+      await revertGoldenStore.effectiveEvents(),
+      await revertStore.effectiveEvents(),
+    );
+    compareConfirmations(
+      harness,
+      await revertGoldenStore.changeConfirmations(),
+      await revertStore.changeConfirmations(),
+    );
+    await site3.close();
+    await site4.close();
+    rmSync(revertDir, { recursive: true, force: true });
+    rmSync(revertGoldenDir, { recursive: true, force: true });
+    rmSync(goldenDir, { recursive: true, force: true });
+    rmSync(damagedDir, { recursive: true, force: true });
+    await goldenStore.close();
+
+    /* ---------- 8. 输出最终排期 ---------- */
+    harness.section('8. 最终对外排期');
     const events = await desk.effectiveEvents();
     for (const event of events) console.log(`  ${formatEventLine(event)}`);
     console.log('  改场记录：');
@@ -261,8 +566,8 @@ export async function runE2E(): Promise<number> {
       console.log(`    ${formatConfirmation(confirmation)}`);
     }
 
-    /* ---------- 8. 单元级边界检查 ---------- */
-    harness.section('8. 解析与折叠边界');
+    /* ---------- 9. 单元级边界检查 ---------- */
+    harness.section('9. 解析与折叠边界');
     runUnitChecks((name, condition, detail) =>
       harness.check(name, condition, detail),
     );
