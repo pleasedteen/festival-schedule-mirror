@@ -173,7 +173,7 @@ export class MockSite {
   private epoch = 0;
   private contentVersion: number;
   private rotateAfter: number | null = null;
-  private rateLimit: { seconds: number; remaining: number } | null = null;
+  private rateLimit: { seconds: number; remaining: number; after: number } | null = null;
   private abortAfter: number | null = null;
   private venueRequestCount = 0;
   private readonly stats: MockStats = {
@@ -313,7 +313,12 @@ export class MockSite {
     }
 
     // 临时限流：按站点给出的 Retry-After 恢复访问。
-    if (this.rateLimit && this.rateLimit.remaining > 0) {
+    // after 表示已服务 N 页后才开始限流，可模拟“采到一半正等下一页”。
+    if (
+      this.rateLimit &&
+      this.rateLimit.remaining > 0 &&
+      this.stats.venuePagesServed >= this.rateLimit.after
+    ) {
       this.rateLimit.remaining -= 1;
       this.stats.rateLimited += 1;
       res.writeHead(429, {
@@ -427,6 +432,7 @@ export class MockSite {
             ? {
                 seconds: Number(payload.seconds ?? 1),
                 remaining: Number(payload.remaining ?? 1),
+                after: Math.max(0, Number(payload.after ?? 0)),
               }
             : null;
         response = { ok: true, rateLimit: this.rateLimit };

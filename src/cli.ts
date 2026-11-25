@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Store } from './db/store';
 import { FestivalDesk } from './query/desk';
@@ -18,13 +19,14 @@ function usage(): void {
       启动本地模拟公告站（前台运行，Ctrl+C 结束）
 
   node dist/cli.js collect [--site URL] [--db PATH] [--venue ID ...]
-      采集各剧场公告并写入 DuckDB
+      采集各剧场公告并写入 DuckDB；每个剧场翻到末页即发布，
+      采到一半的剧场沿用上次已发布的公告
 
   node dist/cli.js query event <演出编号> [--db PATH]
   node dist/cli.js query venue <剧场代码> [--db PATH]
   node dist/cli.js query all [--db PATH]
   node dist/cli.js query pending [--db PATH]
-      查询已确认排期（不联网）
+      只读查询已发布的排期（不联网，可与采集并发运行）
 
   node dist/cli.js repair [--db PATH] [--site URL]
       对“待补采”公告所在剧场重新采集
@@ -69,8 +71,12 @@ function dbPath(args: Args): string {
   return resolve(single(args, 'db') ?? DEFAULT_DB);
 }
 
-async function withStore<T>(path: string, fn: (store: Store) => Promise<T>): Promise<T> {
-  const store = await Store.open(path);
+async function withStore<T>(
+  path: string,
+  fn: (store: Store) => Promise<T>,
+  options: { readOnly?: boolean } = {},
+): Promise<T> {
+  const store = await Store.open(path, options);
   try {
     return await fn(store);
   } finally {
@@ -90,35 +96,46 @@ async function cmdCollect(args: Args): Promise<number> {
 
   console.log(`采集站点 ${site}`);
   console.log(`数据库   ${path}`);
-  return withStore(path, async (store) => {
-    const collector = new Collector({
-      baseUrl: site,
-      store,
-      log: (message) => console.log(message),
-    });
-    const result = await collector.collectAll(venues);
-    console.log('');
-    for (const venue of result.venues) {
-      const mark = venue.ok ? '✓' : '✗';
-      console.log(
-        `${mark} ${venue.venueId}（${venueName(venue.venueId)}）` +
-          ` 版式 ${venue.layout ?? '-'} 页数 ${venue.pages}` +
-          ` 公告 ${venue.announcements} 条 待补采 ${venue.pending}` +
-          ` 翻页恢复 ${venue.recoveries} 次 限流等待 ${venue.rateLimitWaits} 次` +
-          (venue.error ? ` 错误：${venue.error}` : ''),
-      );
-    }
-    const desk = new FestivalDesk(store);
-    const pending = await desk.pendingReparse();
-    if (pending.length > 0) {
-      console.log('');
-      console.log(`待补采 ${pending.length} 条：`);
-      for (const row of pending) {
-        console.log(`  - ${row.venueId} ${row.sourceUrl}（${row.parseError ?? '解析失败'}）`);
-      }
-    }
-    return result.venues.every((venue) => venue.ok) ? 0 : 1;
+  const collector = new Collector({
+    baseUrl: site,
+    openStore: () => Store.open(path),
+    log: (message) => console.log(message),
   });
+  const result = await collector.collectAll(venues);
+  console.log('');
+  for (const venue of result.venues) {
+    const mark = venue.ok ? '✓' : '✗';
+    const publish = venue.ok
+      ? venue.published
+        ? '已发布'
+        : '未采完·沿用上次发布'
+      : '未发布·沿用上次发布';
+    console.log(
+      `${mark} ${venue.venueId}（${venueName(venue.venueId)}）` +
+        ` 版式 ${venue.layout ?? '-'} 页数 ${venue.pages}` +
+        ` 公告 ${venue.announcements} 条 待补采 ${venue.pending}` +
+        ` 翻页恢复 ${venue.recoveries} 次 限流等待 ${venue.rateLimitWaits} 次` +
+        ` ${publish}` +
+        (venue.error ? ` 错误：${venue.error}` : ''),
+    );
+  }
+  // 汇总走只读查询，与服务台看到的数据口径一致。
+  return withStore(
+    path,
+    async (store) => {
+      const desk = new FestivalDesk(store);
+      const pending = await desk.pendingReparse();
+      if (pending.length > 0) {
+        console.log('');
+        console.log(`待补采 ${pending.length} 条：`);
+        for (const row of pending) {
+          console.log(`  - ${row.venueId} ${row.sourceUrl}（${row.parseError ?? '解析失败'}）`);
+        }
+      }
+      return result.venues.every((venue) => venue.ok) ? 0 : 1;
+    },
+    { readOnly: true },
+  );
 }
 
 function printEvent(event: EventState): void {
@@ -134,112 +151,143 @@ function printEvent(event: EventState): void {
 async function cmdQuery(args: Args): Promise<number> {
   const [what, value] = args.positional;
   const path = dbPath(args);
-  return withStore(path, async (store) => {
-    const desk = new FestivalDesk(store);
-
-    if (what === 'event') {
-      if (!value) {
-        console.error('请提供演出编号');
-        return 2;
-      }
-      const event = await desk.findEvent(value);
-      if (!event) {
-        console.log(`未找到演出 ${value}`);
-        return 1;
-      }
-      console.log(`演出 ${event.eventId}  ${event.title ?? ''}`);
-      console.log(`状态 ${statusLabel(event.status)}`);
-      printEvent(event);
-      const confs = await desk.confirmations(value);
-      if (confs.length > 0) {
-        console.log('改场记录：');
-        for (const confirmation of confs) {
-          console.log(`  ${formatConfirmation(confirmation)}`);
-        }
-      }
-      return 0;
+  if (!existsSync(path)) {
+    console.error(`数据库不存在：${path}`);
+    console.error('请先运行 collect 采集公告。');
+    return 1;
+  }
+  try {
+    // 只读打开：不建表、不持写锁，采集进程运行时也能查询。
+    return await withStore(path, (store) => runQuery(store, what, value), {
+      readOnly: true,
+    });
+  } catch (error) {
+    const message = (error as Error)?.message ?? String(error);
+    if (/does not exist|Catalog/i.test(message)) {
+      console.error('数据库尚未包含服务台数据，请先运行 collect。');
+      return 1;
     }
+    throw error;
+  }
+}
 
-    if (what === 'venue') {
-      if (!value) {
-        console.error('请提供剧场代码');
-        return 2;
+async function runQuery(
+  store: Store,
+  what: string | undefined,
+  value: string | undefined,
+): Promise<number> {
+  const desk = new FestivalDesk(store);
+
+  if (what === 'event') {
+    if (!value) {
+      console.error('请提供演出编号');
+      return 2;
+    }
+    const event = await desk.findEvent(value);
+    if (!event) {
+      console.log(`未找到演出 ${value}`);
+      return 1;
+    }
+    console.log(`演出 ${event.eventId}  ${event.title ?? ''}`);
+    console.log(`状态 ${statusLabel(event.status)}`);
+    printEvent(event);
+    const confs = await desk.confirmations(value);
+    if (confs.length > 0) {
+      console.log('改场记录：');
+      for (const confirmation of confs) {
+        console.log(`  ${formatConfirmation(confirmation)}`);
       }
-      if (!VENUES[value]) {
-        console.error(`未知剧场代码：${value}（可用：${VENUE_IDS.join(', ')}）`);
-        return 2;
-      }
-      const events = await desk.venueSchedule(value);
-      console.log(`${venueName(value)}（${value}）有效排期 ${events.length} 场`);
-      for (const event of events) {
-        console.log(
-          `  ${event.showTime} 入场 ${event.doorsTime}  ${event.eventId} ${event.title ?? ''}`,
-        );
-      }
-      const all = await desk.effectiveEvents();
-      const related = await desk.pendingChangesForVenue(value);
-      const movedAway = all.filter(
-        (event) =>
-          event.status === 'scheduled' &&
-          event.hasPendingChange &&
-          related.some((item) => item.eventId === event.eventId),
+    }
+    return 0;
+  }
+
+  if (what === 'venue') {
+    if (!value) {
+      console.error('请提供剧场代码');
+      return 2;
+    }
+    if (!VENUES[value]) {
+      console.error(`未知剧场代码：${value}（可用：${VENUE_IDS.join(', ')}）`);
+      return 2;
+    }
+    const events = await desk.venueSchedule(value);
+    console.log(`${venueName(value)}（${value}）有效排期 ${events.length} 场`);
+    for (const event of events) {
+      console.log(
+        `  ${event.showTime} 入场 ${event.doorsTime}  ${event.eventId} ${event.title ?? ''}`,
       );
-      if (movedAway.length > 0) {
-        console.log('改场待确认（仍展示最近一次已确认排期）：');
-        for (const event of movedAway) {
-          console.log(`  ${formatEventLine(event)}`);
-        }
+    }
+    const all = await desk.effectiveEvents();
+    const related = await desk.pendingChangesForVenue(value);
+    const movedAway = all.filter(
+      (event) =>
+        event.status === 'scheduled' &&
+        event.hasPendingChange &&
+        related.some((item) => item.eventId === event.eventId),
+    );
+    if (movedAway.length > 0) {
+      console.log('改场待确认（仍展示最近一次已确认排期）：');
+      for (const event of movedAway) {
+        console.log(`  ${formatEventLine(event)}`);
       }
-      return 0;
     }
+    return 0;
+  }
 
-    if (what === 'pending' || what === undefined) {
-      const pending = await desk.pendingReparse();
-      console.log(`待补采公告 ${pending.length} 条`);
-      for (const row of pending) {
-        console.log(`  - ${row.venueId} ${row.sourceUrl}（${row.parseError ?? '解析失败'}）`);
-      }
-      return 0;
+  if (what === 'pending' || what === undefined) {
+    const pending = await desk.pendingReparse();
+    console.log(`待补采公告 ${pending.length} 条`);
+    for (const row of pending) {
+      console.log(`  - ${row.venueId} ${row.sourceUrl}（${row.parseError ?? '解析失败'}）`);
     }
+    return 0;
+  }
 
-    if (what === 'all') {
-      const events = await desk.effectiveEvents();
-      console.log(`有效排期 ${events.length} 场`);
-      for (const event of events) printEvent(event);
-      return 0;
-    }
+  if (what === 'all') {
+    const events = await desk.effectiveEvents();
+    console.log(`有效排期 ${events.length} 场`);
+    for (const event of events) printEvent(event);
+    return 0;
+  }
 
     console.error(`未知查询对象：${what}`);
     usage();
     return 2;
-  });
 }
 
 async function cmdRepair(args: Args): Promise<number> {
   const path = dbPath(args);
   const site = single(args, 'site') ?? DEFAULT_SITE;
-  return withStore(path, async (store) => {
+  // 读写打开一次：触发自愈/迁移，保证待补采口径与已发布数据一致。
+  const pending = await withStore(path, async (store) => {
     const desk = new FestivalDesk(store);
-    const pending = await desk.pendingReparse();
-    if (pending.length === 0) {
-      console.log('没有待补采公告');
-      return 0;
-    }
-    const venues = [...new Set(pending.map((row) => row.venueId))];
-    console.log(`待补采涉及剧场：${venues.join(', ')}；重新采集…`);
-    const collector = new Collector({
-      baseUrl: site,
-      store,
-      log: (message) => console.log(message),
-    });
-    const result = await collector.collectAll(venues);
-    const remaining = await desk.pendingReparse();
-    console.log(
-      `补采完成：${result.venues.map((venue) => `${venue.venueId} ${venue.ok ? '成功' : '失败'}`).join('，')}`,
-    );
-    console.log(`剩余待补采 ${remaining.length} 条`);
-    return remaining.length === 0 ? 0 : 1;
+    return desk.pendingReparse();
   });
+  if (pending.length === 0) {
+    console.log('没有待补采公告');
+    return 0;
+  }
+  const venues = [...new Set(pending.map((row) => row.venueId))];
+  console.log(`待补采涉及剧场：${venues.join(', ')}；重新采集…`);
+  const collector = new Collector({
+    baseUrl: site,
+    openStore: () => Store.open(path),
+    log: (message) => console.log(message),
+  });
+  const result = await collector.collectAll(venues);
+  return withStore(
+    path,
+    async (store) => {
+      const desk = new FestivalDesk(store);
+      const remaining = await desk.pendingReparse();
+      console.log(
+        `补采完成：${result.venues.map((venue) => `${venue.venueId} ${venue.ok ? (venue.published ? '成功·已发布' : '未采完') : '失败'}`).join('，')}`,
+      );
+      console.log(`剩余待补采 ${remaining.length} 条`);
+      return remaining.length === 0 ? 0 : 1;
+    },
+    { readOnly: true },
+  );
 }
 
 async function cmdMock(args: Args): Promise<number> {

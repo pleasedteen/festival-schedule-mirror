@@ -179,8 +179,8 @@ function withVersion(version: number): VenueContent[] {
   }
   if (version >= 3) {
     // 新剧场端终于发布改场公告：E-1005 由实验剧场迁至海港剧场。
+    // 放在第 1 页，便于验证“中断前已入库的公告在重启续采后参与改场确认”。
     harbor.items = [
-      ...harbor.items,
       change(
         'h-1005-c3',
         'E-1005',
@@ -191,6 +191,7 @@ function withVersion(version: number): VenueContent[] {
         'studio',
         'harbor',
       ),
+      ...harbor.items,
     ];
   }
   return venues;
